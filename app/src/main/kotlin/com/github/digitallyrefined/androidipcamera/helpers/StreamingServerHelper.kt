@@ -390,21 +390,11 @@ class StreamingServerHelper(
 
                   val createdServerSocket = if (useTLS) {
                       try {
-                          // Determine which certificate file to use
-                          val certFile = if (certificatePath != null) {
-                              // Custom certificate - copy from URI to local file
-                              val uri = certificatePath.toUri()
-                              val privateFile = File(context.filesDir, "certificate.p12")
-                              if (privateFile.exists()) privateFile.delete()
-                              context.contentResolver.openInputStream(uri)?.use { input ->
-                                  privateFile.outputStream().use { output ->
-                                      input.copyTo(output)
-                                  }
-                              } ?: throw IOException("Failed to open certificate file")
-                              privateFile
+                          // New imports use private file URIs; retain support for legacy content URIs.
+                          val certificateUri = if (certificatePath != null) {
+                              certificatePath.toUri()
                           } else {
-                              // Personal certificate
-                              File(finalCertificatePath!!)
+                              android.net.Uri.fromFile(File(finalCertificatePath!!))
                           }
 
                           // Android 10 introduced the platform TLS 1.3 implementation. Older
@@ -421,7 +411,9 @@ class StreamingServerHelper(
 
                           for (tlsVersion in tlsVersionsToTry) {
                               try {
-                                  certFile.inputStream().use { inputStream ->
+                                  val input = context.contentResolver.openInputStream(certificateUri)
+                                      ?: throw IOException("Failed to open certificate file")
+                                  input.use { inputStream ->
                                       val keyStore = KeyStore.getInstance("PKCS12")
                                       keyStore.load(inputStream, finalCertificatePassword)
                                       val keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())

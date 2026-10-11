@@ -1,7 +1,9 @@
 package com.github.digitallyrefined.androidipcamera.helpers
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
+import androidx.preference.PreferenceManager
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.cert.X509CertificateHolder
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
@@ -29,6 +31,60 @@ object CertificateHelper {
         // Register BouncyCastle provider if not already registered
         if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
             Security.addProvider(BouncyCastleProvider())
+        }
+    }
+
+    /** Imports a picker document without depending on its URI grant after restart. */
+    fun importCertificate(context: Context, uri: Uri, password: String?): Boolean {
+        // Startup requires a configured password for custom certificates.
+        if (password.isNullOrEmpty()) return false
+        var importedFile: File? = null
+        var saved = false
+        try {
+            val file = File.createTempFile("imported_certificate_", ".p12", context.filesDir)
+            importedFile = file
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                file.outputStream().use { output ->
+                    // Bound the copy itself; provider names and reported sizes are not reliable.
+                    val buffer = ByteArray(8192)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count == -1) break
+                        total += count
+                        if (total > 10 * 1024 * 1024) return false
+                        output.write(buffer, 0, count)
+                    }
+                }
+            } ?: return false
+
+            val localUri = Uri.fromFile(file)
+            if (!InputValidator.isValidCertificatePath(localUri.toString()) ||
+                !InputValidator.validateCertificateUsability(context, localUri, password)) return false
+
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            val previousPath = prefs.getString("certificate_path", null)
+            // Persist the new path before removing the old copy. Each import has its own file.
+            saved = prefs.edit().putString("certificate_path", localUri.toString()).commit()
+            if (!saved) {
+                // commit() also changes the in-memory value when the disk write fails.
+                prefs.edit().putString("certificate_path", previousPath).commit()
+                return false
+            }
+            if (saved && previousPath != null) {
+                val previousUri = Uri.parse(previousPath)
+                if (previousUri.scheme == "file") {
+                    val previousFile = File(previousUri.path ?: "")
+                    if (previousFile.parentFile == context.filesDir &&
+                        previousFile.name.startsWith("imported_certificate_")) previousFile.delete()
+                }
+            }
+            return saved
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to import certificate", e)
+            return saved
+        } finally {
+            if (!saved) importedFile?.delete()
         }
     }
 

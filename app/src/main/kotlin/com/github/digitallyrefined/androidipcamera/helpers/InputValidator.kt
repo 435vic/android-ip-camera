@@ -31,7 +31,7 @@ object InputValidator {
             val file = File(uri.path ?: "")
 
             // Basic path validation
-            if (uri.scheme != "content" && uri.scheme != "file") return false
+            if (uri.scheme != "file") return false
             if (file.extension.lowercase() !in listOf("p12", "pfx")) return false
             if (!file.exists()) return false
 
@@ -57,33 +57,16 @@ object InputValidator {
     // Validate that certificate can be loaded and used for SSL/TLS
     fun validateCertificateUsability(context: Context, certificateUri: Uri, password: String?): Boolean {
         return try {
-            val privateFile = File(context.filesDir, "cert_validation_temp.p12")
-            if (privateFile.exists()) privateFile.delete()
-
-            context.contentResolver.openInputStream(certificateUri)?.use { input ->
-                privateFile.outputStream().use { output ->
-                    input.copyTo(output)
-                }
-            } ?: return false
-
-            // Try to load the certificate
-            privateFile.inputStream().use { inputStream ->
+            context.contentResolver.openInputStream(certificateUri)?.use { inputStream ->
                 val keyStore = KeyStore.getInstance("PKCS12")
                 keyStore.load(inputStream, password?.toCharArray())
+                // A trust store alone cannot provide a server's TLS identity.
+                if (keyStore.aliases().toList().none { keyStore.isKeyEntry(it) }) return false
                 val keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
                 keyManagerFactory.init(keyStore, password?.toCharArray())
-            }
-
-            // Cleanup
-            privateFile.delete()
+            } ?: return false
             true
         } catch (e: Exception) {
-            // Cleanup on failure
-            try {
-                File(context.filesDir, "cert_validation_temp.p12").delete()
-            } catch (cleanupException: Exception) {
-                // Ignore cleanup errors
-            }
             false
         }
     }

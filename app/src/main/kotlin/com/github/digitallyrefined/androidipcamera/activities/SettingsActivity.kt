@@ -15,6 +15,7 @@ import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.PreferenceManager
 import com.github.digitallyrefined.androidipcamera.R
 import com.github.digitallyrefined.androidipcamera.StreamingService
+import com.github.digitallyrefined.androidipcamera.helpers.CertificateHelper
 import com.github.digitallyrefined.androidipcamera.helpers.InputValidator
 import com.github.digitallyrefined.androidipcamera.helpers.RecordingsHelper
 import com.github.digitallyrefined.androidipcamera.helpers.SecureStorage
@@ -39,6 +40,7 @@ class SettingsActivity : AppCompatActivity() {
 
             // Set up certificate selection preference
             findPreference<Preference>("certificate_path")?.apply {
+                summary = preferenceManager.sharedPreferences?.getString("certificate_path", null)
                 setOnPreferenceClickListener {
                     val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                         type = "*/*"
@@ -304,35 +306,18 @@ class SettingsActivity : AppCompatActivity() {
         override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
             if (requestCode == PICK_CERTIFICATE_FILE && resultCode == Activity.RESULT_OK) {
                 data?.data?.let { uri ->
-                    val certificatePath = uri.toString()
-
-                    // Enhanced certificate validation
-                    if (!InputValidator.isValidCertificatePath(certificatePath)) {
-                        Toast.makeText(requireContext(),
-                            "Invalid certificate file, must be a valid .p12 or .pfx file under 10MB",
-                            Toast.LENGTH_LONG).show()
-                        return@let
-                    }
-
-                    // Validate certificate can actually be loaded and used
                     val secureStorage = SecureStorage(requireContext())
                     val certPassword = secureStorage.getSecureString(SecureStorage.KEY_CERT_PASSWORD, "")
-                    val certificateUri = Uri.parse(certificatePath)
 
-                    if (!InputValidator.validateCertificateUsability(requireContext(), certificateUri, certPassword)) {
+                    if (!CertificateHelper.importCertificate(requireContext(), uri, certPassword)) {
                         Toast.makeText(requireContext(),
-                            "Certificate cannot be loaded, check password and file integrity",
+                            "Certificate import failed, check password and select a valid PKCS12 file under 10MB",
                             Toast.LENGTH_LONG).show()
                         return@let
                     }
 
-                    // Store the certificate path
-                    preferenceManager.sharedPreferences?.edit()?.apply {
-                        putString("certificate_path", certificatePath)
-                        apply()
-                    }
-                    // Update the preference summary
-                    findPreference<Preference>("certificate_path")?.summary = certificatePath
+                    findPreference<Preference>("certificate_path")?.summary =
+                        preferenceManager.sharedPreferences?.getString("certificate_path", null)
 
                     Toast.makeText(requireContext(),
                         "Certificate configured, restart the app for changes to take effect",
