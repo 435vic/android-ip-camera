@@ -1,0 +1,7 @@
+services:
+  adb-bridge:
+    platforms: [linux]
+    port: 15037
+    command: >-
+      : "${TAILCAT_ADDRESS:?Set the TAILCAT_ADDRESS project secret}";
+      exec tailcat forward --bind=127.0.0.1 "$TAILCAT_ADDRESS" "$PORT:5037"

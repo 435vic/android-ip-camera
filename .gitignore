@@ -1,6 +1,8 @@
 # Ignore Gradle project-specific cache directory
 .gradle
 
+.envrc
+
 # Ignore Gradle build output directory
 build
 
@@ -19,3 +21,6 @@ certificates
 
 # local build helpers (machine-specific paths)
 _wsl_*.sh
+
+# Amp's machine-specific portal registrations
+.amp/portals/*

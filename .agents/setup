@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+echo "Installing Nix (if missing)..."
+if [[ ! -x "$HOME/.nix-profile/bin/nix" ]] && ! command -v nix >/dev/null; then
+  if [[ ! -d /nix ]]; then
+    sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /nix
+  fi
+  installer="$(mktemp)"
+  trap 'rm -f "$installer"' EXIT
+  curl -fsSL https://releases.nixos.org/nix/nix-2.28.5/install -o "$installer"
+  bash "$installer" --no-daemon --yes --no-modify-profile
+  rm -f "$installer"
+  trap - EXIT
+fi
+
+# The installer cannot change the environment of this running process.
+if [[ -f "$HOME/.nix-profile/etc/profile.d/nix.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.nix-profile/etc/profile.d/nix.sh"
+fi
+export NIX_CONFIG="${NIX_CONFIG:-}
+experimental-features = nix-command flakes"
+
+echo "Building and installing the locked Android development environment..."
+environment="$(nix build "$repo_root#default" --no-link --print-out-paths)"
+# Installing a store path again is unnecessary and creates extra generations.
+if ! nix profile list --json | jq -e --arg path "$environment" \
+  '.elements[] | select(.storePaths | index($path))' >/dev/null; then
+  if nix profile list --json | jq -e '.elements["android-ip-camera-dev"]' >/dev/null; then
+    nix profile remove android-ip-camera-dev
+  fi
+  # Nix 2.28 derives the profile item name from the store path's name.
+  nix profile install "$environment"
+fi
+
+# Persist variables as well as binaries, without invoking Nix on every login.
+marker="# Android IP Camera orb toolchain"
+if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# Android IP Camera orb toolchain
+if [[ -f "$HOME/.nix-profile/etc/profile.d/nix.sh" ]]; then
+  source "$HOME/.nix-profile/etc/profile.d/nix.sh"
+fi
+export PATH="$HOME/.nix-profile/bin:$PATH"
+if [[ -f "$HOME/.nix-profile/share/android-ip-camera/env.sh" && -z "${IN_NIX_SHELL:-}" ]]; then
+  source "$HOME/.nix-profile/share/android-ip-camera/env.sh"
+fi
+EOF
+fi
+
+echo "Verifying the toolchain in a fresh login shell..."
+# Variables must expand in the new login shell, not this setup process.
+# shellcheck disable=SC2016
+env -i HOME="$HOME" USER="$(id -un)" PATH=/usr/bin:/bin /bin/bash -e -lc '
+  java -version
+  adb version
+  command -v tailcat
+  test -d "$ANDROID_HOME/platforms/android-34"
+  test -d "$ANDROID_HOME/build-tools/34.0.0"
+  test -d "$ANDROID_HOME/build-tools/36.0.0"
+  test ! -d "$ANDROID_HOME/emulator"
+  test ! -d "$ANDROID_HOME/system-images"
+  command -v sdkmanager
+  aapt2 version
+'
+echo "Orb setup complete. Build with ./gradlew assembleDebug test."

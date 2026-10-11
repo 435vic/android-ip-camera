@@ -217,6 +217,135 @@ The app uses the following permissions to function:
 
 Some of the code in this repository may be generated with the assistance of AI tools. All changes are reviewed and tested on a real device with a human in the loop before being released.
 
+## Development with Nix (x86_64 Linux / NixOS)
+
+The locked flake provides a **development environment**, not a Nix build of the
+app. Enable Nix's `nix-command` and `flakes` experimental features, then run:
+
+```bash
+nix develop
+./gradlew assembleDebug test
+./gradlew assembleRelease -PskipSigning
+```
+
+Use the repository's Gradle wrapper, not a separately installed Gradle. The shell
+contains JDK 21 (matching the daemon toolchain), Android platform 34, build-tools
+36.0.0 (required by the current Android Gradle plugin), and 34.0.0 (retained for
+the existing reproducible-build workflow). It also includes `adb`, `sdkmanager`,
+`avdmanager`, signing/alignment tools, Git/SSH, certificate tools, Python, jq,
+FFmpeg, ImageMagick, apksigcopier, and ShellCheck. Android Studio is not required.
+
+SDK components come from Nixpkgs' `androidenv.composeAndroidPackages`; the flake
+accepts the Android SDK license and enables unfree packages. `flake.lock` pins
+Nixpkgs and therefore the toolchain. The SDK is read-only: add components to
+`flake.nix` rather than installing them with `sdkmanager`. When updating AGP,
+check its required build-tools version and update `buildToolsVersion` accordingly.
+Update Nixpkgs intentionally with `nix flake update nixpkgs`.
+
+The shell sets `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, and the documented
+`GRADLE_OPTS` aapt2 override. Nixpkgs patches the SDK binaries for NixOS; AGP's
+separate Maven-downloaded aapt2 expects a conventional Linux loader. The override
+selects Nix's patched binary without an FHS container or changes to app build
+configuration. See the [Nixpkgs Android documentation](https://nixos.org/manual/nixpkgs/unstable/#android)
+and this [NixOS Discourse example](https://discourse.nixos.org/t/android-adb-expo-configuration/37785/4).
+If Android Studio previously wrote `local.properties`, ensure its `sdk.dir` does
+not point at a different SDK.
+
+Gradle still downloads its wrapper distribution and Maven dependencies and writes
+normal build caches. This pins the **development tools**, not every network input
+or the resulting APK bytes. The existing reproducible-build instructions below
+remain separate; this shell does not claim signed-release reproducibility with
+build-tools 36.
+
+### Amp orbs
+
+`.agents/setup` installs Nix 2.28.5 if missing, builds the locked `buildEnv`, and
+installs it into the local user's Nix profile. A login-shell hook loads the same
+exports as `nix develop`, so tools are available to Amp and supervised services
+without manually entering a shell. Setup is non-interactive and safe to repeat;
+it replaces only the `android-ip-camera-dev` profile item when the toolchain
+changes. Bootstrap requires the orb's Bash, curl, jq, CA certificates, and sudo
+permission to create `/nix`. No credentials or signing keys are installed.
+
+To apply or validate it manually in an orb, run `.agents/setup`, then use a new
+login shell. Do not run this orb bootstrap on NixOS: use the machine's existing
+Nix installation and `nix develop`. Automatic fresh orbs use setup from the
+project's default branch; a local `tweaks` commit is not active for future orbs
+until it reaches that branch. No resume script or background service is needed
+for the toolchain itself.
+
+#### Physical phone via Tailcat
+
+The toolchain includes Tailcat. On the computer with the USB-connected,
+ADB-authorized phone, keep `tailcat serve 5037` running (for example, via
+`nix shell nixpkgs#tailcat --command tailcat serve 5037`). Keep its address private:
+it grants access to every device attached to that computer's ADB server.
+
+Set the address as the **project secret** `TAILCAT_ADDRESS` in Amp's Secrets &
+Env Vars settings, not in a committed file or a thread message. Set the non-secret
+project variable `ADB_SERVER_SOCKET` to `tcp:127.0.0.1:15037` so ordinary ADB
+commands use the bridge. After activation, start the declared, supervised bridge
+from the orb repository root:
+
+```bash
+amp orb services ensure
+adb devices -l
+```
+
+`.amp/services.yaml` forwards only `127.0.0.1:15037` to the host's ADB server
+on port 5037, without a portal. Setup installs tools but does not start the tunnel
+or require the secret while building a snapshot. No resume hook is needed for
+the supervised bridge. A listening bridge does not prove the host is reachable;
+use `adb devices -l` to check end-to-end connectivity.
+
+The host must stay awake with the phone connected. Coordinate device operations
+between orbs, and do not run `adb kill-server` against the shared host server.
+When the host Tailcat address changes, update the project secret and restart the
+orb bridge with the updated runtime environment.
+
+**Orbs have no KVM. Do not install or run Android emulators or AVDs in an orb.**
+The default shell/profile excludes both emulators and system images. Native app
+visual verification needs a connected Android device or a KVM-capable runner.
+Browser device emulation can inspect the web control panel but is not an Android
+device and does not verify camera/foreground-service behavior.
+
+### Emulator shell — KVM-capable hosts/runners only
+
+On an x86_64 Linux / NixOS host with readable and writable `/dev/kvm`, use the
+separate shell. It adds the Android emulator and an API 34 Google APIs x86_64 image;
+it is never installed by orb setup. On NixOS, enable `programs.adb.enable = true`
+for physical-device udev rules and give your user `adbusers` and `kvm` group
+membership as appropriate (log in again after changing groups).
+
+```bash
+# Run on your host/runner, NEVER in an orb.
+test -r /dev/kvm && test -w /dev/kvm
+nix develop .#emulator
+emulator -accel-check
+export ANDROID_AVD_HOME="$HOME/.android/avd"
+mkdir -p "$ANDROID_AVD_HOME"
+# Create once; AVD data belongs in your home, not the read-only SDK.
+avdmanager create avd --name android-ip-camera-api34 \
+  --package 'system-images;android-34;google_apis;x86_64'
+emulator -avd android-ip-camera-api34 -no-snapshot -gpu swiftshader_indirect
+```
+
+Keep the emulator in that terminal; in another terminal enter the same shell:
+
+```bash
+./gradlew assembleDebug
+adb wait-for-device
+adb install -r app/build/outputs/apk/debug/*universal-debug.apk
+adb shell am start -n com.github.digitallyrefined.androidipcamera/.activities.MainActivity
+# After granting permissions and navigating to the state to inspect:
+adb exec-out screencap -p > /tmp/android-ip-camera.png
+```
+
+Inspect captures of permissions, settings, and streaming states; use a real phone
+for camera, microphone, power, and background-service verification. These emulator
+instructions require host validation: an orb cannot exercise them. Select a device
+with `adb -s SERIAL` when more than one is connected.
+
 <details>
 <summary>Reproducible builds</summary>
 
