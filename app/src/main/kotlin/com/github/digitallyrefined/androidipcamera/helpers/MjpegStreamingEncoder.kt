@@ -57,6 +57,11 @@ class MjpegStreamingEncoder(
 
     private var lastFrameTime = 0L
     private var captureRunning = false
+    @Volatile var onPreviewJpeg: ((ByteArray) -> Unit)? = null
+    private var lastPreviewTime = 0L
+
+    fun needsPreviewFrame(): Boolean = onPreviewJpeg != null &&
+        System.currentTimeMillis() - lastPreviewTime >= 200L
 
     override fun processFrame(image: ImageProxy) {
         try {
@@ -115,7 +120,7 @@ class MjpegStreamingEncoder(
 
     /** Camera1 preview callback path (NV21 bytes, no ImageProxy). */
     fun processNv21Frame(nv21: ByteArray, width: Int, height: Int, rotationDegrees: Int) {
-        if (!hasClients()) return
+        if (!hasClients() && !needsPreviewFrame()) return
         try {
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
             val fps = prefs.getString("stream_fps", "30")?.toIntOrNull() ?: 30
@@ -177,6 +182,10 @@ class MjpegStreamingEncoder(
     private fun broadcastJpeg(jpegBytes: ByteArray) {
         lastJpeg = jpegBytes
         lastJpegAtMs = System.currentTimeMillis()
+        if (needsPreviewFrame()) {
+            lastPreviewTime = lastJpegAtMs
+            onPreviewJpeg?.invoke(jpegBytes)
+        }
         val helper = streamingServerHelper ?: return
         val clients = helper.getClients()
         if (clients.isEmpty()) return

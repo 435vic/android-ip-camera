@@ -123,6 +123,7 @@ class CameraXCapture(
     fun start() {
         val future = ProcessCameraProvider.getInstance(ctx)
         future.addListener({
+            if (released) return@addListener
             try {
                 val p = future.get(); provider = p
                 // ImageAnalysis ignores a lone ResolutionStrategy unless a matching AspectRatioStrategy

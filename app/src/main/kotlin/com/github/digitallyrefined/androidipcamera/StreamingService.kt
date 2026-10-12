@@ -103,6 +103,50 @@ class StreamingService : LifecycleService() {
     private var pendingStartJob: kotlinx.coroutines.Job? = null
     private var torchVerifyJob: kotlinx.coroutines.Job? = null
     @Volatile private var cameraCloseStartTime: Long = 0L
+    @Volatile var streamEnabled = false
+        private set
+    @Volatile private var captureGeneration = 0L
+    private val streamMutex = Mutex()
+    private val recordingLock = Any()
+    @Volatile private var exiting = false
+    var onStateChanged: (() -> Unit)? = null
+
+    suspend fun setStreamEnabled(enabled: Boolean) = streamMutex.withLock {
+        if (enabled && (streamEnabled || exiting)) return@withLock
+        streamEnabled = enabled
+        captureGeneration++
+        pendingStartJob?.cancel()
+        torchVerifyJob?.cancel()
+        if (!enabled) {
+            kotlinx.coroutines.withContext(Dispatchers.IO) { streamingServerHelper?.closeClientConnection() }
+            cameraMutex.withLock {
+                recordingNeeded = false
+                cameraHeldForTorch = false
+                PreferenceManager.getDefaultSharedPreferences(this).edit()
+                    .putString(PREF_CAMERA_TORCH, "off").apply()
+                backend?.setTorch(false)
+                stopCamera()
+                h264StreamingEncoder?.awaitRelease()
+                setDeviceTorch(false)
+                snapCache.clear()
+            }
+        } else if (currentSurfaceProvider != null) {
+            startCamera()
+        }
+        startForegroundService()
+        onStateChanged?.invoke()
+    }
+
+    fun toggleStream() { launchMain { setStreamEnabled(!streamEnabled) } }
+
+    fun control(key: String, value: String) {
+        if (!streamEnabled && key == "torch" && value != "off") return
+        handleRemoteControl(key, value)
+    }
+
+    var onPreviewJpeg: ((ByteArray) -> Unit)?
+        get() = mjpegStreamingEncoder?.onPreviewJpeg
+        set(value) { mjpegStreamingEncoder?.onPreviewJpeg = value }
 
     var onClientConnected: (() -> Unit)? = null
     var onClientDisconnected: (() -> Unit)? = null
@@ -166,15 +210,21 @@ class StreamingService : LifecycleService() {
     }
 
     private fun handleStopService() {
-        sendBroadcast(Intent("com.github.digitallyrefined.androidipcamera.CLOSE_APP").setPackage(packageName))
-        stopForeground(true); stopSelf()
+        if (exiting) return
+        exiting = true
+        launchMain {
+            setStreamEnabled(false)
+            kotlinx.coroutines.withContext(Dispatchers.IO) { streamingServerHelper?.stopServer() }
+            sendBroadcast(Intent("com.github.digitallyrefined.androidipcamera.CLOSE_APP").setPackage(packageName))
+            stopForeground(true); stopSelf()
+        }
     }
 
     private fun restartServer() {
         lifecycleScope.launch(Dispatchers.IO) {
             streamingServerHelper?.stopServer()
             kotlinx.coroutines.delay(500)
-            streamingServerHelper?.startStreamingServer()
+            if (!exiting) streamingServerHelper?.startStreamingServer()
         }
     }
 
@@ -216,6 +266,9 @@ class StreamingService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        exiting = true
+        streamEnabled = false
+        captureGeneration++
         super.onDestroy()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
             try { unregisterReceiver(notificationChannelReceiver) } catch (_: Exception) {}
@@ -227,10 +280,12 @@ class StreamingService : LifecycleService() {
         // A setTorchMode torch outlives the process — release it explicitly or the LED burns
         // forever after the service is stopped.
         if (deviceTorchOn) setDeviceTorch(false)
-        lifecycleScope.launch(Dispatchers.IO) { streamingServerHelper?.stopStreamingServer() }
+        // Lifecycle scope is already cancelled. TLS socket close can perform network I/O.
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch { streamingServerHelper?.stopServer() }
     }
 
     private fun startForegroundService() {
+        if (exiting) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java)
                 .createNotificationChannel(NotificationChannel(CHANNEL_ID, "Streaming Service", NotificationManager.IMPORTANCE_LOW))
@@ -242,8 +297,8 @@ class StreamingService : LifecycleService() {
         val restartPI = PendingIntent.getService(this, 2,
             Intent(this, StreamingService::class.java).setAction(ACTION_RESTART_NOTIFICATION), PendingIntent.FLAG_IMMUTABLE)
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Android IP Camera Streaming")
-            .setContentText("Camera server is running in background")
+            .setContentTitle(if (streamEnabled) "Stream active" else "Stream stopped")
+            .setContentText(streamingServerHelper?.listenerStatus ?: "HTTP server starting")
             .setSmallIcon(R.drawable.ic_notification)
             .setLargeIcon(BitmapFactory.decodeResource(resources, R.mipmap.ic_launcher))
             .setContentIntent(contentPI)
@@ -258,17 +313,22 @@ class StreamingService : LifecycleService() {
 
     // MainActivity attaches PreviewView here; camera restarts when a surface is set while streaming.
     fun setPreviewSurface(surfaceProvider: Preview.SurfaceProvider?) {
+        if (currentSurfaceProvider === surfaceProvider) return
         currentSurfaceProvider = surfaceProvider
         // Recording owns the camera session: stopping or restarting the camera now would tear
         // down the encoder and finalize the file, so leave the pipeline alone until it stops.
-        if (localRecorder?.isRecording == true) return
-        val shouldRun = encoders.any { it.hasClients() } || currentSurfaceProvider != null
+        if (hasActiveClients()) return
+        val shouldRun = streamEnabled && (encoders.any { it.hasClients() } || currentSurfaceProvider != null)
         if (shouldRun) {
             debouncedStartCamera()
         } else {
             launchMain {
-                stopCamera()
-                bridgeTorchAcrossIdle()
+                cameraMutex.withLock {
+                    if (!hasActiveClients() && (!streamEnabled || currentSurfaceProvider == null)) {
+                        stopCamera()
+                        bridgeTorchAcrossIdle()
+                    }
+                }
             }
         }
     }
@@ -296,6 +356,7 @@ class StreamingService : LifecycleService() {
     // ---------------- server lifecycle (TLS cert + on-demand camera) ----------------
 
     fun startStreamingServer() {
+        if (exiting) return
         try {
             val secureStorage = SecureStorage(this)
             if (CertificateHelper.certificateExists(this)) {
@@ -323,10 +384,16 @@ class StreamingService : LifecycleService() {
     }
 
     private fun initServer() {
+        if (exiting) return
         if (streamingServerHelper == null) {
             streamingServerHelper = StreamingServerHelper(
                 this,
                 onLog = { Log.i(TAG, "Server: $it"); onLog?.invoke(it) },
+                streamingEnabled = { streamEnabled },
+                onStreamingChanged = { enabled ->
+                    kotlinx.coroutines.runBlocking(Dispatchers.Main) { setStreamEnabled(enabled) }
+                },
+                onListenerChanged = { launchMain { startForegroundService(); onStateChanged?.invoke() } },
                 onClientConnected = {
                     launchMain {
                         onClientConnected?.invoke()
@@ -371,7 +438,16 @@ class StreamingService : LifecycleService() {
                         }
                     }
                 },
-                onControlCommand = { key, value, ts -> handleRemoteControl(key, value, ts) },
+                onControlCommand = { key, value, ts ->
+                    kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                        if (!streamEnabled && key == "torch" && value.lowercase() != "off") {
+                            false
+                        } else {
+                            handleRemoteControl(key, value, ts)
+                            true
+                        }
+                    }
+                },
                 onSnapshot = { id -> snapshot(id) },
                 onRecordStart = { startRecording() },
                 onRecordStop = { stopRecording() },
@@ -553,6 +629,7 @@ class StreamingService : LifecycleService() {
      * after [delayMs]. Immediate restarts (force=true) bypass the debounce.
      */
     private fun debouncedStartCamera(force: Boolean = false, delayMs: Long = 300) {
+        if (!streamEnabled) return
         if (force) {
             pendingStartJob?.cancel()
             pendingStartJob = null
@@ -567,6 +644,8 @@ class StreamingService : LifecycleService() {
     }
 
     private suspend fun startCamera(force: Boolean = false) = cameraMutex.withLock {
+        if (!streamEnabled) return@withLock
+        val generation = captureGeneration
         Log.i(TAG, "startCamera() called. force=$force, selectedCameraId=$selectedCameraId, frontFacing=$frontFacing, currentSurfaceProvider=$currentSurfaceProvider, captureRunning=$captureRunning")
         if (!allPermissionsGranted()) {
             Log.w(TAG, "startCamera bypassed: permissions not granted")
@@ -585,6 +664,7 @@ class StreamingService : LifecycleService() {
         cameraHeldForTorch = false
         stopCamera()
         h264StreamingEncoder?.awaitRelease()
+        if (!streamEnabled || generation != captureGeneration) return@withLock
         try {
             val want = desiredSize()
             val prefs = PreferenceManager.getDefaultSharedPreferences(this)
@@ -619,6 +699,7 @@ class StreamingService : LifecycleService() {
                 // camera ... TimeoutException") — no analysis frames ever arrive. Detect that and fall
                 // back to the Camera1 backend so streaming and snapshots keep working on such devices.
                 if (needsFrames && !waitForCameraXFrame()) {
+                    if (!streamEnabled || generation != captureGeneration) return@withLock
                     Log.w(TAG, "CameraX bound but no frames within ${CAMERAX_FRAME_GRACE_MS}ms — Camera2 session config failed on this device; falling back to Camera1")
                     stopCamera()
                     // Remember the device is Camera2-broken (not the API preference) so the CameraX
@@ -670,7 +751,7 @@ class StreamingService : LifecycleService() {
         val b = backend
         if (b !is CameraXCapture) return true
         var waited = 0L
-        while (!b.hasProducedFrame && waited < CAMERAX_FRAME_GRACE_MS) {
+        while (streamEnabled && !b.hasProducedFrame && waited < CAMERAX_FRAME_GRACE_MS) {
             kotlinx.coroutines.delay(100)
             waited += 100
         }
@@ -682,7 +763,7 @@ class StreamingService : LifecycleService() {
         val cap = Camera1Capture(camera1IndexForSelectedOrFacing(frontFacing), want.width, want.height)
         val pipe = newPipe(Size(cap.chosenW, cap.chosenH))
         cap.start(pipe.surfaceTexture)
-        mjpegStreamingEncoder?.takeIf { it.hasClients() }?.let { mjpeg ->
+        mjpegStreamingEncoder?.let { mjpeg ->
             cap.setPreviewFrameCallback { nv21 ->
                 mjpeg.processNv21Frame(nv21, cap.chosenW, cap.chosenH, cap.previewRotation)
             }
@@ -758,6 +839,9 @@ class StreamingService : LifecycleService() {
                     activeEncoders.filter { it != h264StreamingEncoder }.forEach { it.processFrame(img) }
                 } else if (activeEncoders.isNotEmpty()) {
                     activeEncoders.forEach { it.processFrame(img) }
+                }
+                if (activeEncoders.none { it === mjpegStreamingEncoder } && (recording || activeEncoders.isNotEmpty())) {
+                    mjpegStreamingEncoder?.takeIf { it.needsPreviewFrame() }?.processFrame(img)
                 }
             } catch (e: OutOfMemoryError) {
                 Log.e(TAG, "ImageAnalysis OOM — dropping frame: ${e.message}")
@@ -915,6 +999,7 @@ class StreamingService : LifecycleService() {
      * verifier ([scheduleVerifyTorchRestored]) reclaims it for the next stream.
      */
     private fun bridgeTorchAcrossIdle() {
+        if (!streamEnabled) return
         if (hasActiveClients() || currentSurfaceProvider != null) return
         if (PreferenceManager.getDefaultSharedPreferences(this)
                 .getString(PREF_CAMERA_TORCH, "off") != "on") return
@@ -987,6 +1072,8 @@ class StreamingService : LifecycleService() {
      */
     fun snapshot(cameraId: String): ByteArray? {
         synchronized(snapLock) {
+            if (!streamEnabled) return null
+            val generation = captureGeneration
             snapshotInProgress = true
             try {
                 val deadline = System.currentTimeMillis() + SNAPSHOT_DEADLINE_MS
@@ -998,14 +1085,17 @@ class StreamingService : LifecycleService() {
 
                 // Switch to the target camera, capture, then restore the original stream / stop.
                 fun captureViaRebind(): ByteArray? {
+                    if (!streamEnabled || generation != captureGeneration) return null
                     val orig = frontFacing
                     val origCameraId = selectedCameraId
                     selectCamera(targetFront, targetCameraId)
-                    switchAndWait(force = true, deadline)   // starts the camera even with no live viewers
-                    val jpeg = backend?.let { captureFrom(it, key, deadline) }
+                    switchAndWait(force = true, deadline, generation)
+                    if (!streamEnabled || generation != captureGeneration) return null
+                    val jpeg = backend?.let { captureFrom(it, key, deadline, generation) }
                     frontFacing = orig
                     selectedCameraId = origCameraId
                     launchMain {
+                        if (!streamEnabled || generation != captureGeneration) return@launchMain
                         if (hadViewers) startCamera() else {
                             stopCamera()
                             // The snapshot's temporary session may have stripped the idle torch.
@@ -1043,12 +1133,12 @@ class StreamingService : LifecycleService() {
                             waited += 100
                         }
                         if (live.hasProducedFrame) {
-                            return captureFrom(live, key, deadline) ?: freshCached(key)
+                            return captureFrom(live, key, deadline, generation) ?: freshCached(key)
                         }
                         prefs.edit().putBoolean("camera2_unusable", true).apply()
                         return captureViaRebind()
                     }
-                    return captureFrom(live, key, deadline) ?: freshCached(key)
+                    return captureFrom(live, key, deadline, generation) ?: freshCached(key)
                 }
                 return captureViaRebind()
             } finally {
@@ -1126,17 +1216,21 @@ class StreamingService : LifecycleService() {
     }
 
     /** Take one still from [b] (the backend autofocuses internally). Blocks the caller on a latch. */
-    private fun captureFrom(b: CaptureBackend, key: String, deadlineMs: Long): ByteArray? {
+    private fun captureFrom(b: CaptureBackend, key: String, deadlineMs: Long, generation: Long): ByteArray? {
         // A capture can fail transiently (camera mid-restart, another still's restore rebind still
         // running, HAL briefly busy). Retry cheaply until the deadline rather than giving up on the
         // first miss, and always capture from the CURRENT backend — a restart/fallback can swap it
         // mid-snapshot, and a stale released instance can only fail.
         var result: ByteArray? = null
-        while (System.currentTimeMillis() < deadlineMs) {
+        while (streamEnabled && generation == captureGeneration && System.currentTimeMillis() < deadlineMs) {
             val target = backend ?: b
             val latch = CountDownLatch(1)
             val out = arrayOfNulls<ByteArray>(1)
-            launchMain { target.captureStill { out[0] = it; latch.countDown() } }
+            launchMain {
+                if (streamEnabled && generation == captureGeneration) {
+                    target.captureStill { out[0] = it; latch.countDown() }
+                } else latch.countDown()
+            }
             val remaining = (deadlineMs - System.currentTimeMillis()).coerceAtLeast(100L)
             try { latch.await(remaining, TimeUnit.MILLISECONDS) } catch (_: Exception) {}
             result = out[0]
@@ -1151,12 +1245,16 @@ class StreamingService : LifecycleService() {
                 Log.w(TAG, "Snapshot too large to cache (${it.size} bytes > $maxSize), skipping cache")
             }
         }
-        return result
+        return result.takeIf { streamEnabled && generation == captureGeneration }
     }
 
     /** Restart the camera on the new facing and wait until the backend is bound + 3A converges. */
-    private fun switchAndWait(force: Boolean, deadlineMs: Long) {
-        val l = CountDownLatch(1); launchMain { startCamera(force); l.countDown() }
+    private fun switchAndWait(force: Boolean, deadlineMs: Long, generation: Long) {
+        val l = CountDownLatch(1)
+        launchMain {
+            if (streamEnabled && generation == captureGeneration) startCamera(force)
+            l.countDown()
+        }
         try { l.await((deadlineMs - System.currentTimeMillis()).coerceAtLeast(0L), TimeUnit.MILLISECONDS) } catch (_: Exception) {}
         var n = 0; while (n < 40 && backend?.ready != true && System.currentTimeMillis() < deadlineMs) {
             try { Thread.sleep(100) } catch (_: Exception) {}; n++
@@ -1191,6 +1289,8 @@ class StreamingService : LifecycleService() {
     // Synchronized so the timestamp check and the (async) dispatch stay ordered per request.
     @Synchronized
     private fun handleRemoteControl(key: String, value: String, ts: Long = 0L) {
+        val generation = captureGeneration
+        val applyLive = streamEnabled
         if (!acceptControl(key, ts)) return
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
         // Use the stored camera preference key when persisting per-camera settings so
@@ -1214,6 +1314,7 @@ class StreamingService : LifecycleService() {
                 // restarts that happen every time a stream starts or stops.
                 prefs.edit().putString(PREF_CAMERA_TORCH, if (next) "on" else "off").apply()
                 launchMain {
+                    if (!streamEnabled || generation != captureGeneration) return@launchMain
                     if (next && !captureRunning) {
                         // Nothing is streaming, so there is no backend to talk to. Open the camera
                         // just for the torch and record that this session is ours to close.
@@ -1236,14 +1337,14 @@ class StreamingService : LifecycleService() {
                 val ev = value.toIntOrNull() ?: return
                 prefs.edit().putString("exposure_$id", ev.toString()).apply()
                 if (physicalId.isNotBlank() && physicalId != id) prefs.edit().putString("exposure_$physicalId", ev.toString()).apply()
-                launchMain { backend?.setExposure(ev) }
+                launchMain { if (applyLive && streamEnabled && generation == captureGeneration) backend?.setExposure(ev) }
             }
             "zoom" -> {
                 val z = value.toFloatOrNull() ?: return
                 val zStr = String.format(Locale.US, "%.1f", z)
                 prefs.edit().putString("zoom_$id", zStr).apply()
                 if (physicalId.isNotBlank() && physicalId != id) prefs.edit().putString("zoom_$physicalId", zStr).apply()
-                launchMain { backend?.setZoom(z) }
+                launchMain { if (applyLive && streamEnabled && generation == captureGeneration) backend?.setZoom(z) }
             }
             "focus_distance" -> {
                 val f = value.toFloatOrNull() ?: return
@@ -1254,7 +1355,7 @@ class StreamingService : LifecycleService() {
                     prefs.edit().putString("focus_$id", f.coerceIn(0f, 1f).toString()).apply()
                     if (physicalId.isNotBlank() && physicalId != id) prefs.edit().putString("focus_$physicalId", f.coerceIn(0f, 1f).toString()).apply()
                 }
-                launchMain { backend?.setManualFocus(f) }
+                launchMain { if (applyLive && streamEnabled && generation == captureGeneration) backend?.setManualFocus(f) }
             }
             "snapshot_res" -> {
                 if (value == "max" || value == "stream") {
@@ -1279,7 +1380,7 @@ class StreamingService : LifecycleService() {
                     .putString(PREF_CAMERA_ID, camId())
                     .apply()
                 launchMain {
-                    if (captureRunning) {
+                    if (applyLive && streamEnabled && generation == captureGeneration && captureRunning) {
                         debouncedStartCamera(force = true)
                         if (keepTorchOn) backend?.setTorch(true)
                     }
@@ -1350,6 +1451,8 @@ class StreamingService : LifecycleService() {
     // ---------------- local recording ----------------
 
     fun startRecording(): RecordingResponse {
+        val generation = captureGeneration
+        if (!streamEnabled) return Triple(false, "503 Service Unavailable", """{"error":"stream_stopped"}""")
         if (localRecorder?.isRecording == true) return Triple(false, "409 Conflict",
             """{"error":"already_recording","message":"Recording is already in progress","uri":"${localRecorder?.recordingLocation() ?: ""}"}"""
         )
@@ -1362,7 +1465,7 @@ class StreamingService : LifecycleService() {
         if (!captureRunning || !hasActiveClients()) {
             val latch = CountDownLatch(1)
             launchMain {
-                startCamera(force = true)
+                if (streamEnabled && generation == captureGeneration) startCamera(force = true)
                 latch.countDown()
             }
             try { latch.await(3, TimeUnit.SECONDS) } catch (_: Exception) {}
@@ -1370,7 +1473,7 @@ class StreamingService : LifecycleService() {
 
         var enc = h264StreamingEncoder?.h264HardwareEncoder
         var attempts = 0
-        while (enc == null && attempts < 20) {
+        while (streamEnabled && generation == captureGeneration && enc == null && attempts < 20) {
             try { Thread.sleep(100) } catch (_: Exception) {}
             enc = h264StreamingEncoder?.h264HardwareEncoder
             attempts++
@@ -1384,13 +1487,19 @@ class StreamingService : LifecycleService() {
             )
         }
 
-        return try {
+        return synchronized(recordingLock) { try {
+            if (!streamEnabled || generation != captureGeneration) {
+                recordingNeeded = false
+                return@synchronized Triple(false, "503 Service Unavailable", """{"error":"stream_stopped"}""")
+            }
+            if (localRecorder != null) return@synchronized Triple(false, "409 Conflict", """{"error":"already_recording"}""")
             val recorder = LocalRecorder(this, enc.width, enc.height)
             recorder.start()
             enc.onRecordFrame = { bytes, isKey, pts -> recorder.feedFrame(bytes, isKey, pts) }
             enc.requestKeyFrame()
             localRecorder = recorder
             recordingNeeded = false
+            launchMain { onStateChanged?.invoke() }
             Triple(true, "201 Created", recorder.statusJson())
         } catch (e: Exception) {
             Log.e(TAG, "startRecording failed", e)
@@ -1399,10 +1508,10 @@ class StreamingService : LifecycleService() {
             Triple(false, "500 Internal Server Error",
                 """{"error":"start_failed","message":"${e.message?.replace("\"", "'") ?: "unknown error"}"}"""
             )
-        }
+        } }
     }
 
-    fun stopRecording(): RecordingResponse {
+    fun stopRecording(): RecordingResponse = synchronized(recordingLock) {
         val recorder = localRecorder ?: return Triple(false, "409 Conflict",
             """{"error":"not_recording","message":"No recording is in progress"}"""
         )
@@ -1411,6 +1520,7 @@ class StreamingService : LifecycleService() {
             val finalStatus = recorder.statusJson()
             recorder.stop()
             localRecorder = null
+            launchMain { onStateChanged?.invoke() }
 
             // If no remote network streaming clients are connected, update camera state
             if (!encoders.any { it.hasClients() }) {
@@ -1448,7 +1558,7 @@ class StreamingService : LifecycleService() {
     }
 
     /** Safely stops any active recording (used in stopCamera/onDestroy safety nets). */
-    private fun safeStopRecording() {
+    private fun safeStopRecording() = synchronized(recordingLock) {
         try {
             h264StreamingEncoder?.h264HardwareEncoder?.onRecordFrame = null
             localRecorder?.stop()

@@ -61,7 +61,10 @@ class StreamingServerHelper(
     private val onLog: (String) -> Unit = {},
     private val onClientConnected: () -> Unit = {},
     private val onClientDisconnected: () -> Unit = {},
-    private val onControlCommand: (String, String, Long) -> Unit = { _, _, _ -> },
+    private val streamingEnabled: () -> Boolean = { false },
+    private val onStreamingChanged: (Boolean) -> Unit = {},
+    private val onListenerChanged: () -> Unit = {},
+    private val onControlCommand: (String, String, Long) -> Boolean = { _, _, _ -> true },
     private val onSnapshot: (String) -> ByteArray? = { null },
     private val onRecordStart: () -> Triple<Boolean, String, String> = { Triple(false, "503 Service Unavailable", """{"error":"unavailable"}""") },
     private val onRecordStop: () -> Triple<Boolean, String, String> = { Triple(false, "409 Conflict", """{"error":"not_recording"}""") },
@@ -94,6 +97,10 @@ class StreamingServerHelper(
     private val clients = CopyOnWriteArrayList<Client>()
     private val h264Clients = CopyOnWriteArrayList<Client>()  // raw H.264 (/h264) viewers
     private val audioClients = CopyOnWriteArrayList<Socket>()
+    private val audioRecords = mutableSetOf<AudioRecord>()
+    @Volatile private var mediaGeneration = 0L
+    @Volatile var listenerStatus = "HTTP server starting"
+        private set
     private val failedAttempts = ConcurrentHashMap<String, FailedAttempt>()
     @Volatile
     private var appInForeground: Boolean = true
@@ -123,8 +130,6 @@ class StreamingServerHelper(
     /** Disconnect streaming clients whose writes have not completed within this window. */
     private val STALE_WRITE_TIMEOUT_MS = 15_000L
     private val CONNECTION_CLEANUP_INTERVAL_MS = 60_000L
-    /** Whether the media routes serve at all. The control routes ignore it — see the handler. */
-    private val PREF_STREAMING_ENABLED = "streaming_enabled"
     /** Wait before restarting a server whose accept loop ended on its own — see scheduleServerRestart. */
     private val SERVER_RESTART_DELAY_MS = 5_000L
     /** Hard cap on the whole /video/snapshot request (snapshot() is already internally bounded). */
@@ -170,8 +175,7 @@ class StreamingServerHelper(
             value
         }
 
-    fun isStreamingEnabled(): Boolean =
-        PreferenceManager.getDefaultSharedPreferences(context).getBoolean(PREF_STREAMING_ENABLED, true)
+    fun isStreamingEnabled(): Boolean = streamingEnabled()
 
     /**
      * Flips the streaming gate. Turning it off also drops the viewers that are already connected —
@@ -179,10 +183,8 @@ class StreamingServerHelper(
      * would only apply to whoever connected next.
      */
     private fun setStreamingEnabled(enabled: Boolean) {
-        PreferenceManager.getDefaultSharedPreferences(context).edit()
-            .putBoolean(PREF_STREAMING_ENABLED, enabled).apply()
+        onStreamingChanged(enabled)
         onLog(if (enabled) "Streaming enabled" else "Streaming disabled")
-        if (!enabled) closeClientConnection()
     }
 
     /**
@@ -271,10 +273,8 @@ class StreamingServerHelper(
             generation = serverGeneration
         }
 
-        // Show toast when starting server
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(context, "Server starting...", Toast.LENGTH_SHORT).show()
-        }
+        listenerStatus = "Starting listener…"
+        onListenerChanged()
 
         // Stop existing server BEFORE creating new one (outside the coroutine)
         // This must be done to avoid cancelling the new job
@@ -358,9 +358,8 @@ class StreamingServerHelper(
                                       CertificateHelper.generateCertificate(context, password) == null) {
                                       Handler(Looper.getMainLooper()).post {
                                           onLog("Certificate generation failed")
-                                          Toast.makeText(context,
-                                              "Unable to generate TLS certificate",
-                                              Toast.LENGTH_LONG).show()
+                                          listenerStatus = "Unable to generate TLS certificate. Check certificate settings."
+                                          onListenerChanged()
                                       }
                                       return@launch
                                   }
@@ -376,13 +375,22 @@ class StreamingServerHelper(
                       } catch (e: Exception) {
                           Handler(Looper.getMainLooper()).post {
                               onLog("ERROR: Could not load certificate: ${e.message}")
-                              Toast.makeText(context, "Certificate error, check certificate file and password in Settings", Toast.LENGTH_LONG).show()
+                              listenerStatus = "Certificate error. Check certificate file and password."
+                              onListenerChanged()
                           }
                           return@launch
                       }
                   }
 
-                  val bindAddress = InetAddress.getByName("0.0.0.0")
+                  val bindValue = prefs.getString("bind_address", "0.0.0.0") ?: "0.0.0.0"
+                  if (bindValue != "0.0.0.0" && !android.util.Patterns.IP_ADDRESS.matcher(bindValue).matches() &&
+                      !(bindValue.contains(':') && bindValue.substringBefore('%').matches(Regex("[0-9a-fA-F:.]+")))) {
+                      throw IOException("Invalid bind address '$bindValue'. Choose a numeric local IP in Settings.")
+                  }
+                  val bindAddress = InetAddress.getByName(bindValue)
+                  if (!bindAddress.isAnyLocalAddress && java.net.NetworkInterface.getByInetAddress(bindAddress) == null) {
+                      throw IOException("Bind address $bindValue is unavailable. Connect that network or change Bind address in Settings.")
+                  }
 
                   // Get TLS version preference
                   val tlsVersionPref = prefs.getString("tls_version", "1.3") ?: "1.3"
@@ -470,19 +478,7 @@ class StreamingServerHelper(
 
                           readyServerSocket
                       } catch (keystoreException: Exception) {
-                          Handler(Looper.getMainLooper()).post {
-                              onLog("Certificate loading failed: ${keystoreException.message}")
-                              val errorMsg = when {
-                                  keystoreException.message?.contains("password") == true ->
-                                      "Certificate password is incorrect, check Settings > Advanced Security"
-                                  keystoreException.message?.contains("keystore") == true ->
-                                      "Certificate file is corrupted or invalid, regenerate with setup.bat"
-                                  else ->
-                                      "Certificate error: ${keystoreException.message}"
-                              }
-                              Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show()
-                          }
-                          return@launch
+                          throw IOException("TLS listener failed at $bindValue:$port. Check bind address, port and certificate in Settings: ${keystoreException.message}", keystoreException)
                       }
                   } else {
                       // Use HTTP (no TLS)
@@ -512,11 +508,7 @@ class StreamingServerHelper(
                           }
                           httpSocket ?: throw IOException("Failed to create server socket after retries")
                       } catch (e: Exception) {
-                          Handler(Looper.getMainLooper()).post {
-                              onLog("CRITICAL: Failed to create HTTP server: ${e.message}")
-                              Toast.makeText(context, "Failed to start HTTP server: ${e.message}", Toast.LENGTH_LONG).show()
-                          }
-                          return@launch
+                          throw IOException("HTTP listener failed at $bindValue:$port. Check bind address and port in Settings: ${e.message}", e)
                       }
                   }
                   localServerSocket = createdServerSocket
@@ -530,13 +522,14 @@ class StreamingServerHelper(
                   if (!published) return@launch
 
                   serverWasPublished = true
+                  val host = if (bindValue.contains(':')) "[$bindValue]" else bindValue
+                  listenerStatus = "${if (useTLS) "https" else "http"}://$host:$port" +
+                      if (bindAddress.isAnyLocalAddress) " (all interfaces)" else ""
+                  onListenerChanged()
                   onLog("Server started on port $port (${if (useTLS) "HTTPS" else "HTTP"})")
                   // Clear the starting flag now that server is running
                   synchronized(this@StreamingServerHelper) {
                       if (generation == serverGeneration) isStarting = false
-                  }
-                  Handler(Looper.getMainLooper()).post {
-                      Toast.makeText(context, "Server started", Toast.LENGTH_SHORT).show()
                   }
                   var lastConnectionCleanupMs = 0L
                   while (isActive && !Thread.currentThread().isInterrupted) {
@@ -573,6 +566,8 @@ class StreamingServerHelper(
                       }
                   }
               } catch (e: IOException) {
+                  listenerStatus = "HTTP unavailable: ${e.message}"
+                  onListenerChanged()
                   onLog("Could not start server: ${e.message}")
               } finally {
                   try { localServerSocket?.close() } catch (_: IOException) {}
@@ -591,6 +586,7 @@ class StreamingServerHelper(
     }
 
     private suspend fun handleClientConnection(socket: Socket, clientIp: String, generation: Long) {
+        val mediaEpoch = mediaGeneration
         try {
             val outputStream = socket.getOutputStream()
             val writer = PrintWriter(outputStream, true)
@@ -787,8 +783,8 @@ class StreamingServerHelper(
                 return
             }
 
-            if (!isStreamingEnabled() &&
-                (path.startsWith("/video") || path == "/audio" || path == "/audio/raw" || path == "/audio/upload")
+            if ((!isStreamingEnabled() || mediaEpoch != mediaGeneration) &&
+                (path.startsWith("/video") || path == "/audio" || path == "/audio/raw" || path == "/audio/upload" || path == "/record/start")
             ) {
                 writer.print("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
                 writer.print("Streaming is disabled. POST /control/start to re-enable.\r\n")
@@ -807,6 +803,7 @@ class StreamingServerHelper(
                 var jpeg = onSnapshot(id)
                 var attempt = 0
                 while (jpeg == null && attempt < SNAPSHOT_MAX_ATTEMPTS &&
+                    isStreamingEnabled() && mediaEpoch == mediaGeneration &&
                     System.currentTimeMillis() < deadline && !socket.isClosed) {
                     attempt++
                     try {
@@ -815,10 +812,11 @@ class StreamingServerHelper(
                         // If coroutine is cancelled or interrupted, stop retrying
                         break
                     }
+                    if (!isStreamingEnabled() || mediaEpoch != mediaGeneration) break
                     jpeg = onSnapshot(id)
                 }
 
-                if (jpeg != null) {
+                if (jpeg != null && isStreamingEnabled() && mediaEpoch == mediaGeneration) {
                     writer.print("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n")
                     writer.print("Content-Length: ${jpeg.size}\r\n")
                     writer.print("Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n")
@@ -895,7 +893,12 @@ class StreamingServerHelper(
 
                 params.forEach { (key, value) ->
                     if (key == "ts") return@forEach
-                    onControlCommand(key, value, ts)
+                    if (!onControlCommand(key, value, ts)) {
+                        writer.print("HTTP/1.1 409 Conflict\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nStart streaming before enabling or toggling the torch.")
+                        writer.flush()
+                        socket.close()
+                        return
+                    }
                 }
                 writer.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK")
                 writer.flush()
@@ -914,7 +917,7 @@ class StreamingServerHelper(
                     return
                 }
                 val accepted = synchronized(this) {
-                    if (generation != serverGeneration) false
+                    if (generation != serverGeneration || mediaEpoch != mediaGeneration || !isStreamingEnabled()) false
                     else { audioClients.add(socket); true }
                 }
                 if (!accepted) {
@@ -972,17 +975,18 @@ class StreamingServerHelper(
                         )
                     }
 
-                    val wavHeader = createWavHeader(
-                        sampleRate = sampleRate,
-                        bitsPerSample = 16,
-                        channels = 1
-                    )
-                    writeChunk(outputStream, wavHeader, wavHeader.size)
-
-                    audioRecord.startRecording()
                     val pcmBuffer = ByteArray(bufferSize)
                     val audioPrefs = PreferenceManager.getDefaultSharedPreferences(context)
                     try {
+                        synchronized(this) {
+                            if (!isStreamingEnabled() || mediaEpoch != mediaGeneration || socket.isClosed) {
+                                throw IOException("Stream stopped")
+                            }
+                            audioRecords.add(audioRecord)
+                            audioRecord.startRecording()
+                        }
+                        val wavHeader = createWavHeader(sampleRate = sampleRate, bitsPerSample = 16, channels = 1)
+                        writeChunk(outputStream, wavHeader, wavHeader.size)
                         while (socket.isConnected && !socket.isClosed && appInForeground) {
                             val read = audioRecord.read(pcmBuffer, 0, pcmBuffer.size)
                             if (read <= 0) continue
@@ -1010,11 +1014,14 @@ class StreamingServerHelper(
                             }
                         }
                     } finally {
-                        try {
-                            audioRecord.stop()
-                        } catch (_: Exception) {
+                        synchronized(this) {
+                            if (audioRecords.remove(audioRecord)) {
+                                try { audioRecord.stop() } catch (_: Exception) {}
+                                audioRecord.release()
+                            } else if (audioRecord.state != AudioRecord.STATE_UNINITIALIZED) {
+                                audioRecord.release()
+                            }
                         }
-                        audioRecord.release()
                         try {
                             outputStream.write("0\r\n\r\n".toByteArray())
                             outputStream.flush()
@@ -1064,7 +1071,15 @@ class StreamingServerHelper(
                 }
                 val contentLength = headerMap["content-length"]?.toIntOrNull()
                 val chunked = headerMap["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true
-                handleTalkUpload(socket, reader, writer, contentLength, chunked)
+                synchronized(this) {
+                    if (!isStreamingEnabled() || mediaEpoch != mediaGeneration) {
+                        socket.close()
+                        return
+                    }
+                    audioClients.add(socket)
+                }
+                try { handleTalkUpload(socket, reader, writer, contentLength, chunked, mediaEpoch) }
+                finally { audioClients.remove(socket) }
                 return
             }
 
@@ -1086,7 +1101,7 @@ class StreamingServerHelper(
                 writer.flush()
                 val client = Client(socket, outputStream, writer, System.currentTimeMillis(), isAuthenticated = enableAuth)
                 val accepted = synchronized(this) {
-                    if (generation != serverGeneration) false
+                    if (generation != serverGeneration || mediaEpoch != mediaGeneration || !isStreamingEnabled()) false
                     else { h264Clients.add(client); true }
                 }
                 if (!accepted) {
@@ -1123,7 +1138,7 @@ class StreamingServerHelper(
                 // Add client to list - frames will be sent from MainActivity.processImage()
                 val client = Client(socket, outputStream, writer, System.currentTimeMillis(), isAuthenticated = enableAuth)
                 val accepted = synchronized(this) {
-                    if (generation != serverGeneration) false
+                    if (generation != serverGeneration || mediaEpoch != mediaGeneration || !isStreamingEnabled()) false
                     else { clients.add(client); true }
                 }
                 if (!accepted) {
@@ -1161,6 +1176,7 @@ class StreamingServerHelper(
                 }
             }
         } catch (e: Exception) {
+            android.util.Log.e("StreamingServerHelper", "Client request failed", e)
             onLog("Error handling client connection from $clientIp: ${e.message}")
             try {
                 socket.close()
@@ -1229,14 +1245,15 @@ class StreamingServerHelper(
         reader: BufferedReader,
         writer: PrintWriter,
         contentLength: Int?,
-        chunked: Boolean
+        chunked: Boolean,
+        mediaEpoch: Long
     ) {
         var headersSent = false
         try {
             ensureTalkWatchdog()
             val completed: Boolean
             if (chunked || contentLength == null) {
-                completed = readChunkedBody(reader) { chunk -> writeTalkBytes(chunk) }
+                completed = readChunkedBody(reader) { chunk -> writeTalkBytes(chunk, mediaEpoch) }
             } else {
                 var remaining = contentLength
                 val charBuf = CharArray(8192)
@@ -1251,7 +1268,7 @@ class StreamingServerHelper(
                     val chunk = ByteArray(n)
                     for (i in 0 until n) chunk[i] = charBuf[i].code.toByte()
                     remaining -= n
-                    clean = writeTalkBytes(chunk)
+                    clean = writeTalkBytes(chunk, mediaEpoch)
                 }
                 completed = clean && remaining <= 0
             }
@@ -1285,8 +1302,9 @@ class StreamingServerHelper(
         }
     }
 
-    private fun writeTalkBytes(chunk: ByteArray): Boolean {
+    private fun writeTalkBytes(chunk: ByteArray, mediaEpoch: Long): Boolean {
         return synchronized(talkLock) {
+            if (!isStreamingEnabled() || mediaEpoch != mediaGeneration) return@synchronized false
             try {
                 if (talkTrack == null) {
                     val minBuf = AudioTrack.getMinBufferSize(
@@ -1478,6 +1496,10 @@ class StreamingServerHelper(
             editor.apply()
             onLog("Reset preferences for camera $cameraId")
 
+            // Do not apply another lens's defaults to the selected camera.
+            val selected = prefs.getString("camera_id", null)
+            if (selected != cameraId && selected?.substringAfter(':') != physical) return
+
             // Apply canonical defaults immediately so the live camera reflects the reset
             try {
                 val info = buildDeviceInfo()
@@ -1565,7 +1587,20 @@ class StreamingServerHelper(
         }
     }
 
+    @Synchronized
     fun closeClientConnection() {
+        mediaGeneration++
+        audioRecords.forEach {
+            try { it.stop() } catch (_: Exception) {}
+            it.release()
+        }
+        audioRecords.clear()
+        synchronized(talkLock) {
+            try { talkTrack?.stop() } catch (_: Exception) {}
+            talkTrack?.release()
+            talkTrack = null
+            talkTrackActive = false
+        }
         val clientsToClose = clients.toList()
         val h264ClientsToClose = h264Clients.toList()
         val audioClientsToClose = audioClients.toList()
@@ -1689,9 +1724,11 @@ class StreamingServerHelper(
         }.toString()
     }
 
+    // Native controls use the same metadata and per-camera preference resolution as HTTP.
+    fun deviceInfo(): JSONObject = JSONObject(buildDeviceInfo().toJsonString())
+
     private fun buildDeviceInfo(): DeviceInfo {
-        val idle = clients.isEmpty() && h264Clients.isEmpty()
-        val cameraList = buildCameraInfoList(idle)
+        val cameraList = buildCameraInfoList()
         // Gather per-camera stored settings from SharedPreferences. Keys use suffixes like
         // zoom_<cameraId>, exposure_<cameraId>, focus_<cameraId> which are already used
         // by getStreamSettings()/handleRemoteControl.
@@ -1845,7 +1882,7 @@ class StreamingServerHelper(
         }
     } catch (_: Throwable) { false }
 
-    private fun buildCameraInfoList(idle: Boolean): List<InfoCamera> {
+    private fun buildCameraInfoList(): List<InfoCamera> {
         val encCaps = H264HardwareEncoder.caps()
         val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         return try {
@@ -1896,13 +1933,7 @@ class StreamingServerHelper(
                     map?.getOutputSizes(SurfaceTexture::class.java)?.forEach { set.add(it.width to it.height) }
                     map?.getOutputSizes(android.media.MediaCodec::class.java)?.forEach { set.add(it.width to it.height) }
                 } catch (_: Exception) {}
-                if (idle) {  // Camera1 preview sizes expose 16:9 that LEGACY Camera2 omits
-                    try {
-                        @Suppress("DEPRECATION") val c1 = android.hardware.Camera.open(source.physicalId?.toIntOrNull() ?: source.logicalId.toIntOrNull() ?: source.fallbackIndex)
-                        @Suppress("DEPRECATION") c1.parameters.supportedPreviewSizes?.forEach { set.add(it.width to it.height) }
-                        @Suppress("DEPRECATION") c1.release()
-                    } catch (_: Exception) {}
-                }
+                // Metadata requests must not open camera hardware, including while stopped.
                 val sizes = set
                     .filter { it.first <= encCaps.maxW && it.second <= encCaps.maxH }
                     .sortedByDescending { it.first * it.second }
