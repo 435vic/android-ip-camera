@@ -1,18 +1,19 @@
 package com.github.digitallyrefined.androidipcamera.activities
 
 import android.app.Activity
-import android.content.Intent
+import android.content.*
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
-import android.widget.Toast
+import android.text.InputType
+import android.text.method.PasswordTransformationMethod
+import android.widget.EditText
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.documentfile.provider.DocumentFile
-import androidx.preference.EditTextPreference
-import androidx.preference.Preference
-import androidx.preference.PreferenceFragmentCompat
-import androidx.preference.PreferenceManager
+import androidx.preference.*
 import com.github.digitallyrefined.androidipcamera.R
 import com.github.digitallyrefined.androidipcamera.StreamingService
 import com.github.digitallyrefined.androidipcamera.helpers.CertificateHelper
@@ -23,345 +24,225 @@ import com.github.digitallyrefined.androidipcamera.helpers.SecureStorage
 class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        supportFragmentManager
-            .beginTransaction()
-            .replace(android.R.id.content, SettingsFragment())
-            .commit()
+        supportActionBar?.setDisplayHomeAsUpEnabled(true)
+        if (savedInstanceState == null) supportFragmentManager.beginTransaction()
+            .replace(android.R.id.content, SettingsFragment()).commit()
     }
+    override fun onSupportNavigateUp(): Boolean { finish(); return true }
 
     class SettingsFragment : PreferenceFragmentCompat() {
-        companion object {
-            private const val PICK_CERTIFICATE_FILE = 1
-            private const val PICK_RECORDING_FOLDER = 2
+        private lateinit var secure: SecureStorage
+        private var service: StreamingService? = null
+        private var bound = false
+        private val handler = Handler(Looper.getMainLooper())
+        private val status = object : Runnable {
+            override fun run() {
+                findPreference<Preference>("connection_status")?.summary =
+                    service?.streamingServerHelper?.listenerStatus ?: "Connecting to service…"
+                handler.postDelayed(this, 500)
+            }
+        }
+        private val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+                service = (binder as StreamingService.LocalBinder).getService()
+            }
+            override fun onServiceDisconnected(name: ComponentName) { service = null }
+        }
+
+        override fun onStart() {
+            super.onStart()
+            bound = requireContext().bindService(Intent(requireContext(), StreamingService::class.java), connection, 0)
+            handler.post(status)
+        }
+        override fun onStop() {
+            handler.removeCallbacks(status)
+            if (bound) requireContext().unbindService(connection)
+            bound = false
+            service = null
+            super.onStop()
         }
 
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
             setPreferencesFromResource(R.xml.preferences, rootKey)
-
-            // Set up certificate selection preference
-            findPreference<Preference>("certificate_path")?.apply {
-                summary = preferenceManager.sharedPreferences?.getString("certificate_path", null)
-                setOnPreferenceClickListener {
-                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                        type = "*/*"
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                    }
-                    startActivityForResult(
-                        Intent.createChooser(intent, "Select TLS Certificate"),
-                        PICK_CERTIFICATE_FILE
-                    )
-                    true
-                }
-
-                setOnPreferenceChangeListener { _, _ ->
-                    // Restart server when certificate path changes
-                    restartStreamingServer()
+            secure = SecureStorage(requireContext())
+            listOf("username", "password", "certificate_password").forEach {
+                findPreference<EditTextPreference>(it)?.isPersistent = false
+            }
+            updateSummaries()
+            updateVisibility()
+            listOf("enable_auth", "tls_version").forEach { key ->
+                findPreference<Preference>(key)?.setOnPreferenceChangeListener { _, _ ->
+                    handler.post { updateVisibility(); updateSummaries() }
                     true
                 }
             }
+            findPreference<Preference>("apply_connection")?.setOnPreferenceClickListener {
+                requireContext().startService(Intent(requireContext(), StreamingService::class.java).apply {
+                    action = StreamingService.ACTION_RESTART_SERVER
+                })
+                findPreference<Preference>("connection_status")?.summary = "Applying connection settings…"
+                true
+            }
+            findPreference<Preference>("connection_status")?.setOnPreferenceClickListener {
+                val prefs = preferenceManager.sharedPreferences!!
+                val scheme = if (prefs.getString("tls_version", "1.3") == "disabled") "http" else "https"
+                val port = prefs.getString("server_port", "4444")
+                val addresses = java.net.NetworkInterface.getNetworkInterfaces().toList().flatMap { network ->
+                    network.inetAddresses.toList().filter { !it.isLoopbackAddress }.map { address ->
+                        val host = address.hostAddress ?: ""
+                        "$scheme://${if (host.contains(':')) "[$host]" else host}:$port"
+                    }
+                }
+                message("Connection", (listOf(service?.streamingServerHelper?.listenerStatus ?: "Listener unavailable") + addresses).joinToString("\n\n"))
+                true
+            }
+            findPreference<Preference>("certificate_path")?.setOnPreferenceClickListener {
+                startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply {
+                    type = "*/*"; addCategory(Intent.CATEGORY_OPENABLE)
+                }, 1)
+                true
+            }
+            findPreference<Preference>("test_certificate")?.setOnPreferenceClickListener {
+                val path = preferenceManager.sharedPreferences?.getString("certificate_path", null)
+                val password = secure.getSecureString(SecureStorage.KEY_CERT_PASSWORD, "")
+                val valid = !password.isNullOrEmpty() && if (path != null)
+                    InputValidator.validateCertificateUsability(requireContext(), Uri.parse(path), password)
+                else InputValidator.validateBuiltInCertificate(requireContext(), password)
+                message("Certificate validation", if (valid) "Certificate configuration is valid." else
+                    "Validation failed. Check the certificate file and certificate password.")
+                true
+            }
+            findPreference<Preference>("recording_storage_uri")?.setOnPreferenceClickListener {
+                startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                }, 2)
+                true
+            }
+            findPreference<Preference>("reset_recording_storage")?.setOnPreferenceClickListener {
+                RecordingsHelper.customStorageUri(requireContext())?.let { uri ->
+                    try { requireContext().contentResolver.releasePersistableUriPermission(uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (_: Exception) { }
+                }
+                preferenceManager.sharedPreferences!!.edit().remove(RecordingsHelper.PREF_RECORDING_STORAGE_URI).apply()
+                updateSummaries()
+                true
+            }
+        }
 
-            val secureStorage = SecureStorage(requireContext())
-
-            // Configure authentication enable/disable checkbox
-            findPreference<androidx.preference.CheckBoxPreference>("enable_auth")?.apply {
-                // Initialize visibility based on current value
-                val enabled = isChecked
-                findPreference<EditTextPreference>("username")?.isVisible = enabled
-                findPreference<EditTextPreference>("password")?.isVisible = enabled
-
-                setOnPreferenceChangeListener { _, newValue ->
-                    val enabled = newValue as Boolean
-                    // Show/hide username and password preferences
-                    findPreference<EditTextPreference>("username")?.isVisible = enabled
-                    findPreference<EditTextPreference>("password")?.isVisible = enabled
-                    // Restart server when authentication setting changes
-                    restartStreamingServer()
-                    true
+        override fun onDisplayPreferenceDialog(preference: Preference) {
+            if (preference !is EditTextPreference) { super.onDisplayPreferenceDialog(preference); return }
+            val key = preference.key
+            val secretKey = when (key) {
+                "username" -> SecureStorage.KEY_USERNAME
+                "password" -> SecureStorage.KEY_PASSWORD
+                "certificate_password" -> SecureStorage.KEY_CERT_PASSWORD
+                else -> null
+            }
+            val password = key == "password" || key == "certificate_password"
+            val input = EditText(requireContext()).apply {
+                setSingleLine(true)
+                inputType = when {
+                    password -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    key == "server_port" -> InputType.TYPE_CLASS_NUMBER
+                    else -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                }
+                if (password) {
+                    transformationMethod = PasswordTransformationMethod.getInstance()
+                    hint = "Blank keeps current"
+                    isSaveEnabled = false
+                    if (android.os.Build.VERSION.SDK_INT >= 26) importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO
+                } else setText(if (secretKey != null) secure.getSecureString(secretKey, "") else preference.text)
+                setSelectAllOnFocus(true)
+            }
+            val padding = (24 * resources.displayMetrics.density).toInt()
+            val errorText = android.widget.TextView(requireContext()).apply {
+                setTextColor(android.graphics.Color.rgb(255, 180, 171))
+                accessibilityLiveRegion = android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE
+                visibility = android.view.View.GONE
+            }
+            val fields = android.widget.LinearLayout(requireContext()).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                addView(input)
+                addView(errorText)
+            }
+            fun showError(message: String) {
+                errorText.text = message
+                errorText.visibility = android.view.View.VISIBLE
+            }
+            val dialog = AlertDialog.Builder(requireContext()).setTitle(preference.title)
+                .setMessage(preference.dialogMessage).setView(fields, padding, 8, padding, 8)
+                .setNegativeButton("Cancel", null).setPositiveButton("Save", null).create()
+            dialog.setOnShowListener {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    val value = input.text.toString().let { if (key == "bind_address") it.trim() else it }
+                    if (password && value.isEmpty()) { dialog.dismiss(); return@setOnClickListener }
+                    val error = when {
+                        key == "username" && !InputValidator.isValidUsername(value) -> "Use 1–50 letters, numbers, hyphens or underscores."
+                        key == "password" && !InputValidator.isValidPassword(value) -> "Use 8–128 characters with uppercase, lowercase and a number."
+                        key == "certificate_password" && !InputValidator.isValidCertificatePassword(value) -> "Use at most 256 characters."
+                        key == "server_port" && value.toIntOrNull() !in 1..65535 -> "Use a port from 1 to 65535."
+                        key == "bind_address" && !validAddress(value) -> "Enter a numeric IP address. Use 0.0.0.0 for all IPv4 interfaces, or :: for all IPv6 interfaces."
+                        else -> null
+                    }
+                    if (error != null) { showError(error); return@setOnClickListener }
+                    if (secretKey != null) {
+                        if (!secure.putSecureString(secretKey, value)) { showError("Could not save securely. Try again."); return@setOnClickListener }
+                    } else preference.text = value
+                    updateSummaries()
+                    dialog.dismiss()
                 }
             }
+            dialog.show()
+        }
 
-            // Configure TLS version preference to hide/show certificate options
-            findPreference<androidx.preference.ListPreference>("tls_version")?.apply {
-                // Initialize visibility based on current value
-                val tlsEnabled = value != "disabled"
-                findPreference<Preference>("certificate_path")?.isVisible = tlsEnabled
-                findPreference<EditTextPreference>("certificate_password")?.isVisible = tlsEnabled
-                findPreference<Preference>("test_certificate")?.isVisible = tlsEnabled
+        private fun validAddress(value: String): Boolean = try {
+            (value == "0.0.0.0" || android.util.Patterns.IP_ADDRESS.matcher(value).matches() ||
+                (value.contains(':') && value.substringBefore('%').matches(Regex("[0-9a-fA-F:.]+")))) &&
+                java.net.InetAddress.getByName(value) != null
+        } catch (_: Exception) { false }
 
-                setOnPreferenceChangeListener { _, newValue ->
-                    val tlsEnabled = newValue != "disabled"
-                    // Show/hide certificate preferences
-                    findPreference<Preference>("certificate_path")?.isVisible = tlsEnabled
-                    findPreference<EditTextPreference>("certificate_password")?.isVisible = tlsEnabled
-                    findPreference<Preference>("test_certificate")?.isVisible = tlsEnabled
-                    // Restart server when TLS version changes
-                    restartStreamingServer()
-                    true
-                }
+        private fun updateVisibility() {
+            val auth = findPreference<CheckBoxPreference>("enable_auth")?.isChecked == true
+            listOf("username", "password").forEach { findPreference<Preference>(it)?.isVisible = auth }
+            val tls = findPreference<ListPreference>("tls_version")?.value != "disabled"
+            listOf("certificate_path", "certificate_password", "test_certificate").forEach { findPreference<Preference>(it)?.isVisible = tls }
+        }
+
+        private fun updateSummaries() {
+            val prefs = preferenceManager.sharedPreferences!!
+            findPreference<Preference>("username")?.summary = secure.getSecureString(SecureStorage.KEY_USERNAME, "Not set")
+            mapOf("password" to SecureStorage.KEY_PASSWORD, "certificate_password" to SecureStorage.KEY_CERT_PASSWORD).forEach { (key, storageKey) ->
+                findPreference<Preference>(key)?.summary = if (secure.getSecureString(storageKey, "").isNullOrEmpty()) "Not set" else "Set"
             }
+            findPreference<Preference>("server_port")?.summary = prefs.getString("server_port", "4444")
+            val bind = prefs.getString("bind_address", "0.0.0.0") ?: "0.0.0.0"
+            findPreference<Preference>("bind_address")?.summary = if (bind == "0.0.0.0" || bind == "::") "$bind — all interfaces" else "$bind — this address only"
+            findPreference<ListPreference>("tls_version")?.let { it.summary = it.entry }
+            findPreference<Preference>("certificate_path")?.summary = prefs.getString("certificate_path", null)?.let { Uri.parse(it).lastPathSegment } ?: "Device certificate"
+            val uri = RecordingsHelper.customStorageUri(requireContext())
+            findPreference<Preference>("recording_storage_uri")?.summary = if (uri == null) RecordingsHelper.DEFAULT_RELATIVE_PATH else DocumentFile.fromTreeUri(requireContext(), uri)?.name ?: uri.toString()
+        }
 
-            // Configure username (optional - defaults available)
-            findPreference<EditTextPreference>("username")?.apply {
-                // Load current value from secure storage
-                text = secureStorage.getSecureString(SecureStorage.KEY_USERNAME, "")
-
-                setOnPreferenceChangeListener { _, newValue ->
-                    val username = newValue.toString()
-                    if (username.isNotEmpty() && !InputValidator.isValidUsername(username)) {
-                        Toast.makeText(requireContext(),
-                            "Username must be 1-50 characters, letters/numbers/hyphens/underscores only",
-                            Toast.LENGTH_LONG).show()
-                        return@setOnPreferenceChangeListener false
-                    }
-                    // Store securely (empty string means use default)
-                    secureStorage.putSecureString(SecureStorage.KEY_USERNAME, username)
-                    // Restart server when username changes
-                    restartStreamingServer()
-                    true
-                }
-            }
-
-            // Configure password (optional - defaults available)
-            findPreference<EditTextPreference>("password")?.apply {
-                // Do not show the existing password when editing
-                setOnBindEditTextListener { editText ->
-                    editText.text = null
-                    editText.hint = "Enter new password"
-                }
-
-                setOnPreferenceChangeListener { _, newValue ->
-                    val password = newValue.toString()
-
-                    // Empty input means "no change" – keep existing password
-                    if (password.isEmpty()) {
-                        return@setOnPreferenceChangeListener false
-                    }
-
-                    if (!InputValidator.isValidPassword(password)) {
-                        Toast.makeText(
-                            requireContext(),
-                            "Password must be 8-128 characters with uppercase, lowercase, and number",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        return@setOnPreferenceChangeListener false
-                    }
-
-                    // Store securely only; do not persist plaintext in SharedPreferences
-                    secureStorage.putSecureString(SecureStorage.KEY_PASSWORD, password)
-                    // Restart server when password changes
-                    restartStreamingServer()
-                    // Returning false prevents EditTextPreference from saving the plaintext
-                    false
-                }
-            }
-
-            // Configure streaming port preference
-            findPreference<EditTextPreference>("server_port")?.apply {
-                setOnBindEditTextListener { editText ->
-                    editText.inputType = android.text.InputType.TYPE_CLASS_NUMBER
-                }
-
-                setOnPreferenceChangeListener { _, newValue ->
-                    val portStr = newValue.toString()
-                    val port = portStr.toIntOrNull()
-                    if (port == null || port !in 1..65535) {
-                        Toast.makeText(
-                            requireContext(),
-                            "Port must be between 1 and 65535",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        return@setOnPreferenceChangeListener false
-                    }
-                    summary = "Port $port"
-                    restartStreamingServer()
-                    true
-                }
-            }
-
-            // Add validation for certificate password
-            findPreference<EditTextPreference>("certificate_password")?.apply {
-                // Do not pre-fill the existing certificate password when editing
-                setOnBindEditTextListener { editText ->
-                    editText.text = null
-                    editText.hint = "Enter certificate password"
-                }
-
-                setOnPreferenceChangeListener { _, newValue ->
-                    val password = newValue.toString()
-                    if (!InputValidator.isValidCertificatePassword(password)) {
-                        Toast.makeText(
-                            requireContext(),
-                            "Certificate password too long (max 256 characters)",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        return@setOnPreferenceChangeListener false
-                    }
-
-                    // Basic validation - check if password is not empty for certificate usage
-                    if (password.isEmpty()) {
-                        Toast.makeText(
-                            requireContext(),
-                            "Certificate password is required",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        return@setOnPreferenceChangeListener false
-                    }
-
-                    // Store securely only; do not persist plaintext in SharedPreferences
-                    secureStorage.putSecureString(SecureStorage.KEY_CERT_PASSWORD, password)
-                    Toast.makeText(
-                        requireContext(),
-                        "Certificate password saved, use 'Test Certificate Setup' to validate",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    // Restart server when certificate password changes
-                    restartStreamingServer()
-                    // Returning false prevents EditTextPreference from saving the plaintext
-                    false
-                }
-            }
-
-            // Configure the video recording storage location (defaults to Movies/AndroidIPCamera)
-            findPreference<Preference>("recording_storage_uri")?.apply {
-                summary = recordingStorageSummary()
-                setOnPreferenceClickListener {
-                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-                        addFlags(
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                        )
-                    }
-                    startActivityForResult(
-                        Intent.createChooser(intent, "Select recording folder"),
-                        PICK_RECORDING_FOLDER
-                    )
-                    true
-                }
-            }
-
-            findPreference<Preference>("reset_recording_storage")?.apply {
-                setOnPreferenceClickListener {
-                    val current = RecordingsHelper.customStorageUri(requireContext())
-                    if (current != null) {
-                        try {
-                            requireContext().contentResolver.releasePersistableUriPermission(
-                                current,
-                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                            )
-                        } catch (_: Exception) {
-                            // Permission may already be gone; nothing to release
-                        }
-                    }
-                    PreferenceManager.getDefaultSharedPreferences(requireContext()).edit()
-                        .remove(RecordingsHelper.PREF_RECORDING_STORAGE_URI)
-                        .apply()
-                    findPreference<Preference>("recording_storage_uri")?.summary = recordingStorageSummary()
-                    Toast.makeText(requireContext(),
-                        "Recordings will be saved to Movies/AndroidIPCamera",
-                        Toast.LENGTH_SHORT).show()
-                    true
-                }
-            }
-
-            // Add test certificate functionality
-            findPreference<Preference>("test_certificate")?.apply {
-                setOnPreferenceClickListener {
-                    val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
-                    val certificatePath = prefs.getString("certificate_path", null)
-                    val certPassword = secureStorage.getSecureString(SecureStorage.KEY_CERT_PASSWORD, "")
-
-                    if (certPassword.isNullOrEmpty()) {
-                        Toast.makeText(requireContext(),
-                            "Certificate password not configured, set it above first",
-                            Toast.LENGTH_LONG).show()
-                        return@setOnPreferenceClickListener true
-                    }
-
-                    val isValid = if (certificatePath != null) {
-                        // Test custom certificate
-                        val certUri = android.net.Uri.parse(certificatePath)
-                        InputValidator.validateCertificateUsability(requireContext(), certUri, certPassword)
-                    } else {
-                        // Test built-in certificate
-                        InputValidator.validateBuiltInCertificate(requireContext(), certPassword)
-                    }
-
-                    if (isValid) {
-                        Toast.makeText(requireContext(),
-                            "✅ Certificate configuration is valid",
-                            Toast.LENGTH_LONG).show()
-                    } else {
-                        Toast.makeText(requireContext(),
-                            "❌ Certificate validation failed, check password and certificate file",
-                            Toast.LENGTH_LONG).show()
-                    }
-
-                    true
-                }
-            }
-
+        private fun message(title: String, text: String) {
+            AlertDialog.Builder(requireContext()).setTitle(title).setMessage(text).setPositiveButton("OK", null).show()
         }
 
         override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-            if (requestCode == PICK_CERTIFICATE_FILE && resultCode == Activity.RESULT_OK) {
-                data?.data?.let { uri ->
-                    val secureStorage = SecureStorage(requireContext())
-                    val certPassword = secureStorage.getSecureString(SecureStorage.KEY_CERT_PASSWORD, "")
-
-                    if (!CertificateHelper.importCertificate(requireContext(), uri, certPassword)) {
-                        Toast.makeText(requireContext(),
-                            "Certificate import failed, check password and select a valid PKCS12 file under 10MB",
-                            Toast.LENGTH_LONG).show()
-                        return@let
-                    }
-
-                    findPreference<Preference>("certificate_path")?.summary =
-                        preferenceManager.sharedPreferences?.getString("certificate_path", null)
-
-                    Toast.makeText(requireContext(),
-                        "Certificate configured, restart the app for changes to take effect",
-                        Toast.LENGTH_SHORT).show()
-                }
-            }
-
-            if (requestCode == PICK_RECORDING_FOLDER && resultCode == Activity.RESULT_OK) {
-                data?.data?.let { uri ->
-                    try {
-                        requireContext().contentResolver.takePersistableUriPermission(
-                            uri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                        )
-                        PreferenceManager.getDefaultSharedPreferences(requireContext()).edit()
-                            .putString(RecordingsHelper.PREF_RECORDING_STORAGE_URI, uri.toString())
-                            .apply()
-                        findPreference<Preference>("recording_storage_uri")?.summary = recordingStorageSummary()
-                        Toast.makeText(requireContext(),
-                            "Recording location updated", Toast.LENGTH_SHORT).show()
-                    } catch (e: Exception) {
-                        Toast.makeText(requireContext(),
-                            "Could not use that folder: ${e.message}",
-                            Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
             super.onActivityResult(requestCode, resultCode, data)
-        }
-
-        /** Summary for the storage preference: the chosen folder name or the default path. */
-        private fun recordingStorageSummary(): String {
-            val uri = RecordingsHelper.customStorageUri(requireContext())
-                ?: return "Default: ${RecordingsHelper.DEFAULT_RELATIVE_PATH}"
-            val name = DocumentFile.fromTreeUri(requireContext(), uri)?.name
-            return "Custom folder: ${name ?: uri}"
-        }
-
-        private fun restartStreamingServer() {
-            val intent = Intent(requireContext(), StreamingService::class.java).apply {
-                action = StreamingService.ACTION_RESTART_SERVER
+            if (resultCode != Activity.RESULT_OK) return
+            val uri = data?.data ?: return
+            if (requestCode == 1) {
+                if (!CertificateHelper.importCertificate(requireContext(), uri, secure.getSecureString(SecureStorage.KEY_CERT_PASSWORD, ""))) {
+                    message("Certificate import failed", "Check the password and select a PKCS12 file under 10 MB.")
+                }
+            } else if (requestCode == 2) {
+                try {
+                    requireContext().contentResolver.takePersistableUriPermission(uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    preferenceManager.sharedPreferences!!.edit().putString(RecordingsHelper.PREF_RECORDING_STORAGE_URI, uri.toString()).apply()
+                } catch (e: Exception) { message("Folder unavailable", e.message ?: "Could not use that folder.") }
             }
-            requireContext().startService(intent)
-            Toast.makeText(requireContext(), "Server restarting...", Toast.LENGTH_SHORT).show()
+            updateSummaries()
         }
     }
 }

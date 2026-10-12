@@ -20,8 +20,8 @@ class SecureStorage(context: Context) {
     private val encryptedPrefs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         createEncryptedPreferences(context)
     } else {
-        // Fallback for older Android versions
-        context.getSharedPreferences("secure_prefs", Context.MODE_PRIVATE)
+        // Never persist secrets without encrypted storage.
+        null
     }
 
     companion object {
@@ -95,21 +95,21 @@ class SecureStorage(context: Context) {
                 }
             }
             
-            // All retries failed, fall back to regular SharedPreferences
-            Log.e(TAG, "Failed to create encrypted preferences after multiple retries, falling back to regular SharedPreferences", lastException)
-            context.getSharedPreferences("secure_prefs", Context.MODE_PRIVATE)
+            // Let callers report a failed save rather than writing secrets in plaintext.
+            Log.e(TAG, "Failed to create encrypted preferences after multiple retries", lastException)
+            null
         }
     }
 
     // Store sensitive data securely
     fun putSecureString(key: String, value: String?): Boolean {
         // Use commit() to ensure synchronous write for critical data like certificate passwords
-        return encryptedPrefs.edit().putString(key, value).commit()
+        return encryptedPrefs?.edit()?.putString(key, value)?.commit() == true
     }
 
     // Retrieve sensitive data securely
     fun getSecureString(key: String, defaultValue: String? = null): String? {
-        val stored = encryptedPrefs.getString(key, null)
+        val stored = encryptedPrefs?.getString(key, null)
         if (stored != null && stored.isNotEmpty()) return stored
 
         // No defaults - force user configuration for security
@@ -118,11 +118,11 @@ class SecureStorage(context: Context) {
 
     // Remove sensitive data
     fun removeSecureString(key: String) {
-        encryptedPrefs.edit().remove(key).apply()
+        encryptedPrefs?.edit()?.remove(key)?.apply()
     }
 
     // Check if secure storage contains a key
     fun containsSecureString(key: String): Boolean {
-        return encryptedPrefs.contains(key)
+        return encryptedPrefs?.contains(key) == true
     }
 }
