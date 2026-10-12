@@ -1,74 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="#000000">
-
+    android:layout_width="match_parent" android:layout_height="match_parent" android:background="#000000">
     <androidx.camera.view.PreviewView
-        android:id="@+id/viewFinder"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent" />
-
-    <TextView
-        android:id="@+id/noClientMessage"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:layout_margin="24dp"
-        android:gravity="center"
-        android:padding="16dp"
-        android:text="No users are connected, visit the URL below to start the camera"
-        android:textColor="#FFFFFF"
-        android:textSize="18sp"
-        android:background="#80000000"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
-
-    <LinearLayout
-        android:id="@+id/topRightButtonBar"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:layout_margin="16dp"
-        android:gravity="end"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
-        <ImageButton
-            android:id="@+id/settingsButton"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:background="@android:color/transparent"
-            android:src="@android:drawable/ic_menu_preferences"
-            android:contentDescription="Settings" />
-        <ImageButton
-            android:id="@+id/hidePreviewButton"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:background="@android:color/transparent"
-            android:src="@android:drawable/ic_menu_view"
-            android:contentDescription="Toggle Preview" />
-        <ImageButton
-            android:id="@+id/exitButton"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:background="@android:color/transparent"
-            android:src="@android:drawable/ic_menu_close_clear_cancel"
-            android:contentDescription="Exit App" />
+        android:id="@+id/viewFinder" android:layout_width="0dp" android:layout_height="0dp"
+        app:scaleType="fitCenter" app:implementationMode="compatible"
+        app:layout_constraintTop_toTopOf="parent" app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent" app:layout_constraintEnd_toEndOf="parent" />
+    <ImageView android:id="@+id/streamPreview" android:layout_width="0dp" android:layout_height="0dp"
+        android:scaleType="fitCenter" android:importantForAccessibility="no" android:background="#000000"
+        app:layout_constraintTop_toTopOf="@id/viewFinder" app:layout_constraintBottom_toBottomOf="@id/viewFinder"
+        app:layout_constraintStart_toStartOf="parent" app:layout_constraintEnd_toEndOf="parent" />
+    <LinearLayout android:id="@+id/controls" android:layout_width="wrap_content" android:layout_height="56dp"
+        android:orientation="horizontal" android:gravity="center"
+        app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/hidePreviewButton" app:layout_constraintHorizontal_chainStyle="packed">
+        <ImageButton android:id="@+id/streamButton" style="@style/HomeControl" android:src="@drawable/ic_start" android:contentDescription="Start stream" />
+        <ImageButton android:id="@+id/cameraButton" style="@style/HomeControl" android:src="@drawable/ic_camera" android:contentDescription="Camera and lens" />
+        <ImageButton android:id="@+id/zoomButton" style="@style/HomeControl" android:src="@drawable/ic_zoom" android:contentDescription="Zoom" />
+        <ImageButton android:id="@+id/micButton" style="@style/HomeControl" android:src="@drawable/ic_mic" android:contentDescription="Microphone gain" />
+        <ImageButton android:id="@+id/settingsButton" style="@style/HomeControl" android:src="@drawable/ic_settings" android:contentDescription="Settings and connection" />
     </LinearLayout>
-
-    <TextView
-        android:id="@+id/ipAddressText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="16dp"
-        android:layout_marginStart="16dp"
-        android:textSize="16sp"
-        android:textColor="#FFFFFF"
-        android:background="#80000000"
-        android:padding="8dp"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent" />
-
+    <ImageButton android:id="@+id/hidePreviewButton" style="@style/HomeControl" android:src="@drawable/ic_visibility"
+        android:contentDescription="Hide preview" android:layout_marginBottom="4dp"
+        app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintStart_toEndOf="@id/controls"
+        app:layout_constraintEnd_toEndOf="parent" />
 </androidx.constraintlayout.widget.ConstraintLayout>

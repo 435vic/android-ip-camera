@@ -1,419 +1,237 @@
 package com.github.digitallyrefined.androidipcamera.activities
 
 import android.Manifest
-import android.annotation.SuppressLint
-import android.content.BroadcastReceiver
-import android.content.ComponentName
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.content.ServiceConnection
+import android.content.*
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.util.Log
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
-import android.view.WindowManager
-import android.widget.ImageButton
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.PopupMenu
 import androidx.activity.OnBackPressedCallback
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.preference.PreferenceManager
 import com.github.digitallyrefined.androidipcamera.R
 import com.github.digitallyrefined.androidipcamera.StreamingService
 import com.github.digitallyrefined.androidipcamera.databinding.ActivityMainBinding
-import java.net.Inet4Address
-import java.net.NetworkInterface
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
-    private lateinit var viewBinding: ActivityMainBinding
-    private var streamingService: StreamingService? = null
-    private var isBound = false
-    private var hasRequestedPermissions = false
-    private var userHiddenPreview = false
-    private lateinit var noClientMessage: TextView
-    private lateinit var backGestureCallback: OnBackPressedCallback
+    private lateinit var binding: ActivityMainBinding
+    private var service: StreamingService? = null
+    private var bound = false
+    private var hidden = false
+    private var resumed = false
+    private lateinit var backCallback: OnBackPressedCallback
 
     private val connection = object : ServiceConnection {
-        override fun onServiceConnected(className: ComponentName, service: IBinder) {
-            val binder = service as StreamingService.LocalBinder
-            streamingService = binder.getService()
-            isBound = true
-
-            // Connect UI listeners
-            streamingService?.onClientConnected = {
-                runOnUiThread {
-                    showNoClientMessage(false)
-                }
-            }
-            streamingService?.onClientDisconnected = {
-                runOnUiThread {
-                    val hasClients = streamingService?.hasActiveClients() == true
-                    showNoClientMessage(!hasClients)
-                }
-            }
-            streamingService?.onLog = { message ->
-                Log.i(TAG, "Service: $message")
-            }
-
-            // Initialize Server
-            streamingService?.startStreamingServer()
-
-            // Check current status
-            val hasClients = streamingService?.hasActiveClients() == true
-
-            // Set Preview if needed
-            if (!userHiddenPreview) {
-                if (hasClients) {
-                    streamingService?.setPreviewSurface(null)
-                } else {
-                    streamingService?.setPreviewSurface(viewBinding.viewFinder.surfaceProvider)
-                }
-            }
-
-            showNoClientMessage(!hasClients)
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            service = (binder as StreamingService.LocalBinder).getService()
+            bound = true
+            service?.onStateChanged = { runOnUiThread { render() } }
+            service?.onClientConnected = { runOnUiThread { render() } }
+            service?.onClientDisconnected = { runOnUiThread { render() } }
+            service?.startStreamingServer()
+            if (resumed) service?.setPreviewSurface(binding.viewFinder.surfaceProvider)
+            render()
         }
-
-        override fun onServiceDisconnected(arg0: ComponentName) {
-            isBound = false
-            streamingService = null
+        override fun onServiceDisconnected(name: ComponentName) {
+            bound = false
+            service = null
+            render()
         }
     }
-
-    private val cameraRestartReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == "com.github.digitallyrefined.androidipcamera.RESTART_CAMERA") {
-                if (allPermissionsGranted() && isBound) {
-                    // Trigger camera restart in service by re-setting preview or calling explicit method
-                    // For now, re-setting preview triggers restart in service if camera was running
-                    if (!userHiddenPreview) {
-                        val hasClients = streamingService?.hasActiveClients() == true
-                        if (hasClients) {
-                            streamingService?.setPreviewSurface(null)
-                        } else {
-                            streamingService?.setPreviewSurface(viewBinding.viewFinder.surfaceProvider)
-                        }
-                    }
-                }
-            }
-        }
+    private val closeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) { finishAndRemoveTask() }
     }
 
-    private val closeAppReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == "com.github.digitallyrefined.androidipcamera.CLOSE_APP") {
-                finishAndRemoveTask()
-            }
-        }
-    }
-
-    @SuppressLint("SetTextI18n")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Initialize view binding first
-        viewBinding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(viewBinding.root)
-        noClientMessage = findViewById(R.id.noClientMessage)
-
-        backGestureCallback = object : OnBackPressedCallback(false) {
-            override fun handleOnBackPressed() {
-                hideShowPreview()
-            }
-        }
-        onBackPressedDispatcher.addCallback(this, backGestureCallback)
-
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
         supportActionBar?.hide()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false)
-            val controller = window.insetsController
-            controller?.let {
-                it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        hidden = savedInstanceState?.getBoolean("hidden") ?: false
+        backCallback = object : OnBackPressedCallback(hidden) {
+            override fun handleOnBackPressed() { setHidden(false) }
+        }
+        onBackPressedDispatcher.addCallback(this, backCallback)
+        ContextCompat.registerReceiver(this, closeReceiver,
+            IntentFilter("com.github.digitallyrefined.androidipcamera.CLOSE_APP"), ContextCompat.RECEIVER_NOT_EXPORTED)
+        binding.streamButton.setOnClickListener { service?.toggleStream() }
+        binding.hidePreviewButton.setOnClickListener { setHidden(!hidden) }
+        binding.settingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+        binding.cameraButton.setOnClickListener { anchor ->
+            val info = service?.streamingServerHelper?.deviceInfo() ?: return@setOnClickListener
+            val cameras = info.getJSONArray("cameras")
+            val selected = info.getJSONObject("settings").optString("cameraId")
+            PopupMenu(this, anchor).apply {
+                for (i in 0 until cameras.length()) {
+                    val camera = cameras.getJSONObject(i)
+                    menu.add(0, i, i, camera.getString("label")).apply {
+                        isCheckable = true
+                        isChecked = camera.getString("id") == selected
+                    }
+                }
+                menu.setGroupCheckable(0, true, true)
+                setOnMenuItemClickListener {
+                    service?.control("camera", cameras.getJSONObject(it.itemId).getString("id"))
+                    true
+                }
+                show()
             }
+        }
+        binding.zoomButton.setOnClickListener { anchor -> showZoom(anchor) }
+        binding.micButton.setOnClickListener { anchor ->
+            val current = service?.streamingServerHelper?.deviceInfo()?.getJSONObject("settings")?.optString("audioGain")?.toFloatOrNull() ?: 1f
+            val values = listOf(0.5f, 1f, 1.5f, 2f, 3f)
+            PopupMenu(this, anchor).apply {
+                values.forEachIndexed { i, gain ->
+                    menu.add(0, i, i, "Microphone gain ${gain}×").apply {
+                        isCheckable = true
+                        isChecked = current == gain
+                    }
+                }
+                menu.setGroupCheckable(0, true, true)
+                setOnMenuItemClickListener {
+                    service?.control("audio_gain", values[it.itemId].toString())
+                    true
+                }
+                show()
+            }
+        }
+        if (permissions().all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }) {
+            startAndBind()
         } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    )
+            ActivityCompat.requestPermissions(this, permissions() + Manifest.permission.RECORD_AUDIO, 10)
         }
+        render()
+    }
 
-        if (!allPermissionsGranted() && !hasRequestedPermissions) {
-            hasRequestedPermissions = true
-            val toRequest = (REQUIRED_PERMISSIONS + OPTIONAL_PERMISSIONS).distinct().toTypedArray()
-            ActivityCompat.requestPermissions(this, toRequest, REQUEST_CODE_PERMISSIONS)
-        } else if (allPermissionsGranted()) {
-            startService()
-        } else {
-            finish()
-        }
-
-        ContextCompat.registerReceiver(this, cameraRestartReceiver, IntentFilter("com.github.digitallyrefined.androidipcamera.RESTART_CAMERA"), ContextCompat.RECEIVER_NOT_EXPORTED)
-        ContextCompat.registerReceiver(this, closeAppReceiver, IntentFilter("com.github.digitallyrefined.androidipcamera.CLOSE_APP"), ContextCompat.RECEIVER_NOT_EXPORTED)
-
-        showNoClientMessage(true)
-        updateIpAddressText()
-
-        findViewById<ImageButton>(R.id.settingsButton).setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
-        }
-
-        findViewById<ImageButton>(R.id.hidePreviewButton).setOnClickListener {
-            hideShowPreview()
-        }
-
-        findViewById<ImageButton>(R.id.exitButton).setOnClickListener {
-            exitApp()
+    private fun showZoom(anchor: View) {
+        val info = service?.streamingServerHelper?.deviceInfo() ?: return
+        val id = info.getJSONObject("settings").optString("cameraId")
+        val cameras = info.getJSONArray("cameras")
+        val camera = (0 until cameras.length()).map { cameras.getJSONObject(it) }
+            .firstOrNull { it.getString("id") == id } ?: return
+        val zoom = camera.optJSONObject("zoom") ?: return
+        val min = zoom.optDouble("min", 1.0).toFloat()
+        val max = zoom.optDouble("max", 1.0).toFloat()
+        val current = camera.optJSONObject("lensSettings")?.optString("zoom")?.toFloatOrNull() ?: min
+        val values = (listOf(min, 1f, 1.5f, 2f, 3f, 4f, 6f, 8f, max, current)
+            .filter { it in min..max }).distinct().sorted()
+        PopupMenu(this, anchor).apply {
+            values.forEachIndexed { i, value ->
+                menu.add(0, i, i, String.format(Locale.US, "%.1f×", value)).apply {
+                    isCheckable = true
+                    isChecked = kotlin.math.abs(current - value) < 0.05f
+                }
+            }
+            menu.setGroupCheckable(0, true, true)
+            setOnMenuItemClickListener { service?.control("zoom", values[it.itemId].toString()); true }
+            show()
         }
     }
 
-    private fun startService() {
+    private fun startAndBind() {
         val intent = Intent(this, StreamingService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+        ContextCompat.startForegroundService(this, intent)
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
     }
 
+    private fun setHidden(value: Boolean) {
+        hidden = value
+        backCallback.isEnabled = value
+        render()
+        immersive()
+    }
+
+    private fun render() {
+        val active = service?.streamEnabled == true
+        val remote = service?.hasActiveClients() == true
+        binding.controls.visibility = if (hidden) View.INVISIBLE else View.VISIBLE
+        // Alpha leaves the PreviewView surface/session intact. Visibility is display-only:
+        // it must not restart a remote stream, recording, or microphone.
+        binding.viewFinder.alpha = if (!hidden && active && !remote) 1f else 0f
+        binding.streamPreview.visibility = if (!hidden && active && remote) View.VISIBLE else View.INVISIBLE
+        if (!active || !remote) binding.streamPreview.setImageDrawable(null)
+        binding.streamButton.setImageResource(if (active) R.drawable.ic_stop else R.drawable.ic_start)
+        binding.streamButton.contentDescription = if (active) "Stop stream" else "Start stream"
+        binding.hidePreviewButton.contentDescription = if (hidden) "Show preview" else "Hide preview"
+        binding.streamButton.isEnabled = bound
+        service?.onPreviewJpeg = if (resumed && !hidden) { bytes ->
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            runOnUiThread {
+                if (resumed && !hidden && service?.streamEnabled == true) binding.streamPreview.setImageBitmap(bitmap)
+            }
+        } else null
+    }
+
+    private fun immersive() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.apply {
+                hide(WindowInsets.Type.systemBars())
+                systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) immersive()
+    }
     override fun onResume() {
         super.onResume()
-        if (isBound && !userHiddenPreview) {
-            val hasClients = streamingService?.hasActiveClients() == true
-            if (hasClients) {
-                streamingService?.setPreviewSurface(null)
-            } else {
-                streamingService?.setPreviewSurface(viewBinding.viewFinder.surfaceProvider)
-            }
-        }
-        // Refresh the IP address text in case the port was changed in settings
-        updateIpAddressText()
-        checkNotificationChannelEnabled()
+        resumed = true
+        service?.setPreviewSurface(binding.viewFinder.surfaceProvider)
+        render()
+        immersive()
     }
-
-    private fun updateIpAddressText() {
-        val ipAddressText = findViewById<TextView>(R.id.ipAddressText)
-        val ipAddress = getLocalIpAddress()
-        val prefs = PreferenceManager.getDefaultSharedPreferences(this)
-        val tlsVersion = prefs.getString("tls_version", "1.3") ?: "1.3"
-        val protocol = if (tlsVersion == "disabled") "http" else "https"
-        val port = prefs.getString("server_port", "4444")?.toIntOrNull() ?: 4444
-        ipAddressText.text = "$protocol://$ipAddress:$port"
-    }
-
-    private fun checkNotificationChannelEnabled() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-            val channel = manager.getNotificationChannel("streaming_service_channel")
-            if (channel != null && channel.importance == android.app.NotificationManager.IMPORTANCE_NONE) {
-                Toast.makeText(this, "Notification permissions are required for the camera server to function", Toast.LENGTH_LONG).show()
-                exitApp()
-            }
-        }
-    }
-
     override fun onPause() {
+        resumed = false
+        service?.onPreviewJpeg = null
+        service?.setPreviewSurface(null)
         super.onPause()
-        if (isBound) {
-            streamingService?.setPreviewSurface(null)
-        }
     }
-
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("hidden", hidden)
+        super.onSaveInstanceState(outState)
+    }
     override fun onDestroy() {
+        if (bound) {
+            service?.onStateChanged = null
+            service?.onClientConnected = null
+            service?.onClientDisconnected = null
+            service?.onPreviewJpeg = null
+            unbindService(connection)
+        }
+        unregisterReceiver(closeReceiver)
         super.onDestroy()
-        if (isBound) {
-            unbindService(connection)
-            isBound = false
-        }
-        unregisterReceiver(cameraRestartReceiver)
-        unregisterReceiver(closeAppReceiver)
     }
-
-    public fun exitApp() {
-        val stopIntent = Intent(this, StreamingService::class.java).apply {
-            action = StreamingService.ACTION_STOP_SERVICE
-        }
-        startService(stopIntent)
-
-        try {
-            unbindService(connection)
-        } catch (e: IllegalArgumentException) {
-            // Ignore if not bound
-        }
-        isBound = false
-        streamingService = null
-        val intent = Intent(this, StreamingService::class.java)
-        stopService(intent)
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            if (allPermissionsGranted()) {
-                if (!hasAudioPermission()) {
-                    Toast.makeText(this, "Microphone permission denied audio streaming disabled", Toast.LENGTH_LONG).show()
-                }
-                startService()
-            } else {
-                androidx.appcompat.app.AlertDialog.Builder(this)
-                    .setTitle("Permissions Required")
-                    .setMessage("Camera and notification permissions are required for the camera server to function. Please enable them in App Settings.")
-                    .setPositiveButton("Settings") { _, _ ->
-                        val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                            data = android.net.Uri.fromParts("package", packageName, null)
-                        }
-                        startActivity(intent)
-                    }
-                    .setOnCancelListener {
-                        exitApp()
-                    }
-                    .show()
-            }
-        }
-
-        checkNotificationChannelEnabled()
+        if (requestCode != 10) return
+        if (permissions().all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }) {
+            startAndBind()
+        } else AlertDialog.Builder(this).setTitle("Camera permission required")
+            .setMessage("Allow camera and notification access in Android app settings.")
+            .setPositiveButton("Settings") { _, _ ->
+                startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:$packageName")))
+            }.setNegativeButton("Close") { _, _ -> finish() }.show()
     }
-
-    private fun getLocalIpAddress(): String {
-        try {
-            NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface ->
-                networkInterface.inetAddresses.toList().forEach { address ->
-                    if (!address.isLoopbackAddress && address is Inet4Address) {
-                        return address.hostAddress ?: "unknown"
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return "unknown"
-    }
-
-    private fun hideShowPreview() {
-        val viewFinder = viewBinding.viewFinder
-        val rootView = viewBinding.root
-        val ipAddressText = findViewById<TextView>(R.id.ipAddressText)
-        val settingsButton = findViewById<ImageButton>(R.id.settingsButton)
-        val hidePreviewButton = findViewById<ImageButton>(R.id.hidePreviewButton)
-        val exitButton = findViewById<ImageButton>(R.id.exitButton)
-
-        if (!userHiddenPreview) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-            viewFinder.visibility = View.INVISIBLE
-            ipAddressText.visibility = View.GONE
-            settingsButton.visibility = View.GONE
-            noClientMessage.visibility = View.GONE
-            hidePreviewButton.visibility = View.GONE
-            exitButton.visibility = View.GONE
-            rootView.setBackgroundColor(android.graphics.Color.BLACK)
-            userHiddenPreview = true
-            backGestureCallback.isEnabled = true
-
-            if (isBound) {
-                streamingService?.setPreviewSurface(null)
-            }
-
-            runOnUiThread {
-                Toast.makeText(this, "Black screen, swipe back to exit", Toast.LENGTH_SHORT).show()
-            }
-        } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-            ipAddressText.visibility = View.VISIBLE
-            settingsButton.visibility = View.VISIBLE
-            hidePreviewButton.visibility = View.VISIBLE
-            exitButton.visibility = View.VISIBLE
-
-            val hasClients = streamingService?.hasActiveClients() == true
-
-            viewFinder.visibility = if (hasClients) View.INVISIBLE else View.VISIBLE
-            noClientMessage.visibility = if (hasClients) View.VISIBLE else View.GONE
-            noClientMessage.text = if (hasClients) getString(R.string.streaming_active) else ""
-            rootView.setBackgroundColor(if (hasClients) android.graphics.Color.BLACK else android.graphics.Color.TRANSPARENT)
-
-            userHiddenPreview = false
-            backGestureCallback.isEnabled = false
-
-            if (isBound) {
-                if (hasClients) {
-                    streamingService?.setPreviewSurface(null)
-                } else {
-                    streamingService?.setPreviewSurface(viewBinding.viewFinder.surfaceProvider)
-                }
-            }
-        }
-    }
-
-    private fun showNoClientMessage(show: Boolean) {
-        val rootView = viewBinding.root
-        if (show) {
-            noClientMessage.visibility = View.GONE
-            if (!userHiddenPreview) {
-                viewBinding.viewFinder.visibility = View.VISIBLE
-                rootView.setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            }
-            if (isBound) {
-                streamingService?.setPreviewSurface(viewBinding.viewFinder.surfaceProvider)
-            }
-        } else {
-            noClientMessage.text = getString(R.string.streaming_active)
-            noClientMessage.visibility = if (!userHiddenPreview) View.VISIBLE else View.GONE
-            viewBinding.viewFinder.visibility = View.INVISIBLE
-            rootView.setBackgroundColor(android.graphics.Color.BLACK)
-        }
-    }
-
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-    }
-    private fun hasAudioPermission() =
-        ContextCompat.checkSelfPermission(baseContext, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-
-    companion object {
-        private const val TAG = "MainActivity"
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS = when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.POST_NOTIFICATIONS
-            )
-            // WRITE_EXTERNAL_STORAGE is required on API 24-28 for the legacy
-            // local MP4 recording path (scoped storage / MediaStore used on 29+).
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.READ_EXTERNAL_STORAGE
-            )
-            else -> arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.READ_EXTERNAL_STORAGE,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE
-            )
-        }
-        private val OPTIONAL_PERMISSIONS = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(
-                Manifest.permission.RECORD_AUDIO,
-                Manifest.permission.NEARBY_WIFI_DEVICES
-            )
-        } else {
-            arrayOf(
-                Manifest.permission.RECORD_AUDIO,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            )
-        }
+    private fun permissions(): Array<String> = when {
+        Build.VERSION.SDK_INT >= 33 -> arrayOf(Manifest.permission.CAMERA, Manifest.permission.POST_NOTIFICATIONS)
+        Build.VERSION.SDK_INT <= 28 -> arrayOf(Manifest.permission.CAMERA, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        else -> arrayOf(Manifest.permission.CAMERA)
     }
 }
