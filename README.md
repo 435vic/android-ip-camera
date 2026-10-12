@@ -229,11 +229,18 @@ nix develop
 ```
 
 Use the repository's Gradle wrapper, not a separately installed Gradle. The shell
-contains JDK 21 (matching the daemon toolchain), Android platform 34, build-tools
-36.0.0 (required by the current Android Gradle plugin), and 34.0.0 (retained for
-the existing reproducible-build workflow). It also includes `adb`, `sdkmanager`,
+contains JDK 21 (matching the daemon toolchain), Android platform 37.0, and build-tools
+36.0.0 (required by the current Android Gradle plugin and used by CI and Docker).
+It also includes `adb`, `sdkmanager`,
 `avdmanager`, signing/alignment tools, Git/SSH, certificate tools, Python, jq,
 FFmpeg, ImageMagick, apksigcopier, and ShellCheck. Android Studio is not required.
+
+The app uses AGP's built-in Kotlin support. The Compose compiler plugin matches
+AGP's bundled Kotlin version (2.2.10); Compose UI, Material 3, activity integration,
+and preview tooling are available for incremental migration from Views. Java and
+Kotlin target JVM 17, supporting Compose's inline APIs; Kotlin inherits the target
+from `android.compileOptions` without a separate compiler setting. The
+compile SDK is API 37, while the minimum SDK (24) and target SDK (34) are unchanged.
 
 SDK components come from Nixpkgs' `androidenv.composeAndroidPackages`; the flake
 accepts the Android SDK license and enables unfree packages. `flake.lock` pins
@@ -312,7 +319,7 @@ device and does not verify camera/foreground-service behavior.
 ### Emulator shell — KVM-capable hosts/runners only
 
 On an x86_64 Linux / NixOS host with readable and writable `/dev/kvm`, use the
-separate shell. It adds the Android emulator and an API 34 Google APIs x86_64 image;
+separate shell. It adds the Android emulator and an API 37.0 Google APIs x86_64 image;
 it is never installed by orb setup. On NixOS, enable `programs.adb.enable = true`
 for physical-device udev rules and give your user `adbusers` and `kvm` group
 membership as appropriate (log in again after changing groups).
@@ -325,9 +332,9 @@ emulator -accel-check
 export ANDROID_AVD_HOME="$HOME/.android/avd"
 mkdir -p "$ANDROID_AVD_HOME"
 # Create once; AVD data belongs in your home, not the read-only SDK.
-avdmanager create avd --name android-ip-camera-api34 \
-  --package 'system-images;android-34;google_apis;x86_64'
-emulator -avd android-ip-camera-api34 -no-snapshot -gpu swiftshader_indirect
+avdmanager create avd --name android-ip-camera-api37 \
+  --package 'system-images;android-37.0;google_apis;x86_64'
+emulator -avd android-ip-camera-api37 -no-snapshot -gpu swiftshader_indirect
 ```
 
 Keep the emulator in that terminal; in another terminal enter the same shell:

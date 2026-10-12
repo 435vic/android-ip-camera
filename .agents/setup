@@ -60,8 +60,7 @@ env -i HOME="$HOME" USER="$(id -un)" PATH=/usr/bin:/bin /bin/bash -e -lc '
   java -version
   adb version
   command -v tailcat
-  test -d "$ANDROID_HOME/platforms/android-34"
-  test -d "$ANDROID_HOME/build-tools/34.0.0"
+  test -d "$ANDROID_HOME/platforms/android-37.0"
   test -d "$ANDROID_HOME/build-tools/36.0.0"
   test ! -d "$ANDROID_HOME/emulator"
   test ! -d "$ANDROID_HOME/system-images"

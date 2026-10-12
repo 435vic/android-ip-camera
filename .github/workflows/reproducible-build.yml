@@ -18,7 +18,7 @@ jobs:
         uses: actions/setup-java@v6.0.1
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -27,7 +27,7 @@ jobs:
 
       - name: Install SDK components
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0"
 
       - name: Build release APK (first)
         run: |

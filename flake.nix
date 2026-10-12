@@ -17,8 +17,8 @@
         let
           buildToolsVersion = "36.0.0";
           android = pkgs.androidenv.composeAndroidPackages {
-            platformVersions = [ "34" ];
-            buildToolsVersions = [ "34.0.0" buildToolsVersion ];
+            platformVersions = [ "37.0" ];
+            buildToolsVersions = [ buildToolsVersion ];
             includeEmulator = withEmulator;
             includeSystemImages = withEmulator;
             systemImageTypes = [ "google_apis" ];
