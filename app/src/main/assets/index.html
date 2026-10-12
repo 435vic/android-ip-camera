@@ -551,7 +551,9 @@
         // Update local UI state immediately so the client reflects server-side
         // changes without needing to re-fetch /info.json.
         try { updateLocalLensSetting(param, val); } catch (_) { }
-        return fetch('/?' + encodeURIComponent(param) + '=' + encodeURIComponent(val) + '&ts=' + nextControlTs()).catch(() => { });
+        return fetch('/?' + encodeURIComponent(param) + '=' + encodeURIComponent(val) + '&ts=' + nextControlTs(), {
+          method: 'POST', headers: { 'X-Camera-Control': '1' }
+        }).catch(() => { });
       } catch (_) { /* swallow */ }
     }
 
@@ -707,7 +709,9 @@
         const cam = selectedCameraInfo();
         const id = cam ? cam.id : '';
         if (!id) return;
-        fetch('/?resetCamera=' + encodeURIComponent(id), { method: 'GET', credentials: 'include' })
+        fetch('/?resetCamera=' + encodeURIComponent(id), {
+          method: 'POST', headers: { 'X-Camera-Control': '1' }, credentials: 'include'
+        })
           .then(() => {
             loadDeviceInfo(true);
             setView("fit")
@@ -1555,7 +1559,7 @@
     function toggleRecording() {
       const wasRecording = isRecording;
       const url = wasRecording ? '/record/stop' : '/record/start';
-      fetch(url, { method: 'POST' })
+      fetch(url, { method: 'POST', headers: { 'X-Camera-Control': '1' } })
         .then(r => r.json())
         .then(data => {
           if (data.error) {
@@ -1758,6 +1762,7 @@
       try {
         const res = await fetch('/audio/upload', {
           method: 'POST',
+          headers: { 'X-Camera-Control': '1' },
           body: packet,
           credentials: 'include'
         });

@@ -743,6 +743,48 @@ class StreamingServerHelper(
                 }
             }
 
+            // Commands live at /?key=value; query strings on media/info routes are not controls.
+            val params = parseQueryParams(uri)
+            val controlKeys = setOf(
+                "torch", "exposure", "zoom", "focus_distance", "snapshot_res", "camera",
+                "resolution", "rotate", "scale", "contrast", "mirror", "api", "fps",
+                "audio_gain", "resetCamera"
+            )
+            if (path != "/" && params.keys.any {
+                    it in controlKeys && !(path == "/video/snapshot" && it == "camera")
+                }) {
+                writer.print("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nCamera controls require POST /?key=value\r\n")
+                writer.flush()
+                socket.close()
+                return
+            }
+            val allowedMethod = when {
+                path == "/" && uri.contains('?') -> "POST"
+                path in listOf("/control/start", "/control/stop", "/record/start", "/record/stop", "/audio/upload") -> "POST"
+                path.startsWith("/files/") -> "GET, DELETE"
+                else -> "GET"
+            }
+            if (httpMethod !in allowedMethod.split(", ")) {
+                writer.print("HTTP/1.1 405 Method Not Allowed\r\nAllow: $allowedMethod\r\nConnection: close\r\n\r\n")
+                writer.flush()
+                socket.close()
+                return
+            }
+
+            // A non-safelisted header prevents cross-origin forms/fetches from using cached
+            // Basic credentials (also protects auth-disabled servers). Never enable CORS here:
+            // cross-origin scripts must preflight, and OPTIONS is rejected above. Native clients
+            // can send this header directly; no browser Origin or cookie session is required.
+            if ((httpMethod == "POST" || httpMethod == "DELETE") && !headers.any { hdr ->
+                    hdr.substringBefore(':').trim().equals("X-Camera-Control", ignoreCase = true) &&
+                        hdr.substringAfter(':', "").trim() == "1"
+                }) {
+                writer.print("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nX-Camera-Control: 1 required\r\n")
+                writer.flush()
+                socket.close()
+                return
+            }
+
             // Handle Control UI and Commands
             if (uri == "/" || uri == "") {
                 val htmlResponse = try {
@@ -834,7 +876,7 @@ class StreamingServerHelper(
             }
 
             // ---- Recording endpoints ----
-            if (path == "/record/start" && requestParts[0] == "POST") {
+            if (path == "/record/start" && httpMethod == "POST") {
                 val (_, status, json) = onRecordStart()
                 writer.print("HTTP/1.1 $status\r\n")
                 writer.print("Content-Type: application/json\r\n")
@@ -845,7 +887,7 @@ class StreamingServerHelper(
                 return
             }
 
-            if (path == "/record/stop" && requestParts[0] == "POST") {
+            if (path == "/record/stop" && httpMethod == "POST") {
                 val (_, status, json) = onRecordStop()
                 writer.print("HTTP/1.1 $status\r\n")
                 writer.print("Content-Type: application/json\r\n")
@@ -873,8 +915,7 @@ class StreamingServerHelper(
                 return
             }
 
-            if (uri.contains("?")) {
-                val params = parseQueryParams(uri)
+            if (path == "/" && uri.contains("?")) {
                 val ts = params["ts"]?.toLongOrNull() ?: 0L // for ordering; 0 = none
 
                 // Support a single-shot reset command: ?resetCamera=<id>

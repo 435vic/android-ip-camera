@@ -201,7 +201,9 @@
         btn.disabled = true;
         btn.textContent = 'Deleting...';
         try {
-          const res = await fetch('/files/' + encodeURIComponent(name), {method: 'DELETE'});
+          const res = await fetch('/files/' + encodeURIComponent(name), {
+            method: 'DELETE', headers: { 'X-Camera-Control': '1' }
+          });
           if (res.ok) {
             location.reload();
             return;
